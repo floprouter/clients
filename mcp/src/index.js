@@ -21,8 +21,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { ApiError, DEFAULT_BASE_URL, costOf, isMissingRoute, makeClient, modelFacts } from './api.js';
+import { decideRenewal, grantFacts, grantWarning, parseDuration, renewIfDue } from './renewal.js';
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 const env = process.env;
 // Fallback: the file written by `floprouter login` (the CLI), so one login serves both.
 function cliConfig() {
@@ -39,6 +40,17 @@ const TOOL_BUDGET_MS = Number(env.FLOPROUTER_TOOL_BUDGET_MS || 50_000);
 // reset their timeout on progress can then wait for a slow reply instead of getting `pending`.
 const PROGRESS_BUDGET_MS = Number(env.FLOPROUTER_PROGRESS_BUDGET_MS || 240_000);
 const FINAL = new Set(['settled', 'refunded', 'failed', 'fraud', 'voided']);
+// Opt-in signing. By default this server never touches a wallet key. Only when the configuration names a key file
+// (or seed file) AND sets FLOPROUTER_ALLOW_GRANT_RENEWAL=1 does it offer `renew_grant`, which signs one transaction
+// with that wallet: the same revoke-plus-create renewal as `floprouter grant --auto-renew`, with the same caps.
+const SIGNING = {
+  keyFile: env.FLOPROUTER_KEY_FILE || undefined, seedFile: env.FLOPROUTER_KEY_FILE ? undefined : env.FLOPROUTER_SEED_FILE || undefined,
+  passwordFile: env.FLOPROUTER_PASSWORD_FILE || undefined,
+};
+const SIGNING_ENABLED = env.FLOPROUTER_ALLOW_GRANT_RENEWAL === '1' && Boolean(SIGNING.keyFile || SIGNING.seedFile);
+const AUTO_RENEW = SIGNING_ENABLED && env.FLOPROUTER_AUTO_RENEW === '1';
+const RENEW_BEFORE = parseDuration(env.FLOPROUTER_RENEW_BEFORE || '2d');
+const SIGN_LOG = env.FLOPROUTER_SIGN_LOG || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'floprouter', 'mcp-signatures.log');
 const TIMEOUT_MS = Number(env.FLOPROUTER_TIMEOUT_MS || 300_000);
 
 const json = (v) => JSON.stringify(v);
@@ -70,6 +82,7 @@ function minerRow(m) {
     strikes: m.slashing?.strikes ?? null, calibrated: m.calibration?.live ?? null,
     stake: m.stake?.total ?? null,
     models: (m.models ?? []).map((x) => x.id ?? x.name ?? x),
+    availability: m.availability ?? null, health: m.health ?? null, last_checked_at: m.last_checked_at ?? null,
     reachable: rm.reachable ?? null, ready: rm.ready ?? null, first_output_ms: rm.first_output_ms ?? null,
   };
 }
@@ -87,8 +100,33 @@ function flopSummary(f) {
   };
 }
 
+/** Each signature is logged: one JSON line (time, action, tx, block, owner, delegate, caps), mode 600, and to stderr. */
+function logSignature(e) {
+  const line = JSON.stringify({ at: new Date().toISOString(), ...e });
+  process.stderr.write(`floprouter-mcp: signed ${e.call} (${e.action}) tx ${e.tx}\n`);
+  try { fs.mkdirSync(path.dirname(SIGN_LOG), { recursive: true, mode: 0o700 }); fs.appendFileSync(SIGN_LOG, line + '\n', { mode: 0o600 }); } catch { /* stderr has it */ }
+}
+
 export function buildServer({ apiKey } = {}) {
   const api = makeClient({ baseUrl: BASE_URL, apiKey, timeoutMs: TIMEOUT_MS, userAgent: `floprouter-mcp/${VERSION}` });
+
+  /** The grant to the router's delegate and what it needs, from the router; null without a key or a grant route. */
+  async function grantState() {
+    if (!api.hasKey) return null;
+    let g; try { g = await api.get('/v1/grants'); } catch { return null; }
+    const f = grantFacts(g);
+    const d = decideRenewal(f, { renewBeforeSec: RENEW_BEFORE });
+    return { facts: f, decision: d, warning: grantWarning(f, { renewBeforeSec: RENEW_BEFORE }) };
+  }
+  const runRenew = async (dryRun) => {
+    let wallet;
+    try { wallet = await import('./wallet.js'); await import('@polkadot/api'); } catch {
+      throw new Error('signing needs the polkadot packages: run the server as `npx -y -p floprouter -p floprouter-mcp floprouter-mcp` (see the README, "Opt-in grant renewal")');
+    }
+    return renewIfDue({ client: api, wallet, key: SIGNING, opts: { renewBeforeSec: RENEW_BEFORE }, allowCreate: false, sameCaps: true, dryRun,
+      log: (m) => process.stderr.write(`floprouter-mcp: ${m}\n`), onSigned: logSignature });
+  };
+
   const server = new McpServer({ name: 'floprouter', version: VERSION }, {
     instructions: 'The floprouter API routes chat completions to GPU miners on FLOP Network and pays them in FLOP. ' +
       'Use list_models to see which models are available now (available=true means at least one ready miner). ' +
@@ -141,7 +179,13 @@ export function buildServer({ apiKey } = {}) {
     description: 'One miner in detail: score, on-chain history, stake, calibration, slashing, models with evidence, endpoints and recent channels.',
     inputSchema: { address: z.string().min(47).max(48).describe('Miner SS58 address') },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, tool(async ({ address }) => ok(await api.get(`/v1/miners/${encodeURIComponent(address)}`, { auth: false }))));
+  }, tool(async ({ address }) => {
+    const m = await api.get(`/v1/miners/${encodeURIComponent(address)}`, { auth: false });
+    // Endpoint URLs are not public: never pass one on, even from a router that still sends them.
+    for (const e of m.endpoints ?? []) delete e.url;
+    if (m.endpoint) delete m.endpoint.url;
+    return ok(m);
+  }));
 
   server.registerTool('chat', {
     title: 'Chat completion (paid)',
@@ -167,6 +211,11 @@ export function buildServer({ apiKey } = {}) {
     const messages = a.messages?.length ? a.messages
       : a.prompt ? [...(a.system ? [{ role: 'system', content: a.system }] : []), { role: 'user', content: a.prompt }] : null;
     if (!messages) throw new Error('give `prompt` or `messages`');
+    let renewed = null;
+    if (AUTO_RENEW) {
+      const gs = await grantState();
+      if (gs && (gs.decision.action === 'renew')) renewed = await runRenew(false);
+    }
     const pinned = a.miner ? (Array.isArray(a.miner) ? a.miner : [a.miner]) : null;
     const body = {
       model: a.model, messages, max_tokens: a.max_tokens,
@@ -218,7 +267,10 @@ export function buildServer({ apiKey } = {}) {
       }
     }
     const ignored = (headers?.get('x-floprouter-ignored-parameters') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+    const gs = await grantState();
     return ok({
+      ...(gs?.warning ? { grant_warning: gs.warning } : {}),
+      ...(renewed ? { grant_renewed: { action: renewed.action, reason: renewed.reason, tx: renewed.tx ?? null } } : {}),
       reply: content, finish_reason: finish, model,
       generation_id: id ?? flop?.session_id ?? null,
       cost_flop: costOf({ usage }), cost_final: usage?.cost_details?.final ?? null,
@@ -261,8 +313,36 @@ export function buildServer({ apiKey } = {}) {
       optional(() => api.get('/v1/balance')), optional(async () => (await api.get('/v1/key'))?.data ?? null), optional(() => api.get('/v1/grants')),
     ]);
     if (balance?.recent) balance.recent = balance.recent.slice(0, 10);
-    return ok({ balance, key, grant });
+    const gs = await grantState();
+    return ok({ ...(gs?.warning ? { grant_warning: gs.warning } : {}), balance, key, grant });
   }));
+
+  server.registerTool('grant_status', {
+    title: 'Grant status',
+    description: 'The session-key grant that lets the router open channels paid by the user\'s wallet: state, expiry, days left, spending cap and today\'s room left, and whether renewal is due (under 2 days left or nearly used up). Tell the user when renewal is due: only their wallet can sign a new grant.',
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async () => {
+    if (!api.hasKey) return ok({ unavailable: 'no API key configured' });
+    const gs = await grantState();
+    if (!gs) return ok({ unavailable: 'this router does not report grants' });
+    const f = gs.facts;
+    return ok({
+      state: f.state, expires_at: f.expiresAt ?? null, days_left: f.expiresInSec !== null && f.expiresInSec !== undefined ? Math.round((f.expiresInSec / 86400) * 10) / 10 : null,
+      cap_left: f.remaining ?? null, spending_cap: f.spendingCap ?? null, today_left: f.dayRoom ?? null, per_session_limit: f.perTxLimit ?? null,
+      renewal_due: gs.decision.action === 'renew' || gs.decision.action === 'grant', reason: gs.decision.reason, warning: gs.warning,
+      renewal_by_this_server: SIGNING_ENABLED ? (AUTO_RENEW ? 'enabled, automatic before chat' : 'enabled (renew_grant)') : 'off: the user renews with `floprouter grant` or `floprouter grant --auto-renew`',
+    });
+  }));
+
+  if (SIGNING_ENABLED) {
+    server.registerTool('renew_grant', {
+      title: 'Renew the grant (signs a transaction)',
+      description: 'SIGNS A TRANSACTION WITH THE WALLET CONFIGURED FOR THIS SERVER. Renews the session-key grant only when it is due (expiring within the window, expired, or nearly used up): one utility.batchAll of revokeSession and createSession to the router\'s delegate, with exactly the current caps and only ComputeChannel. Does nothing when no renewal is due; never creates a grant from nothing and never raises caps. Every signature is logged. Use dry_run to see what it would sign.',
+      inputSchema: { dry_run: z.boolean().optional().describe('Check and describe the renewal without signing') },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    }, tool(async ({ dry_run }) => ok(await runRenew(Boolean(dry_run)))));
+  }
 
   server.registerTool('withdraw', {
     title: 'Withdraw prepaid balance',

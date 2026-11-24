@@ -33,7 +33,9 @@ Requires Node 18.17 or later.
 | `login` | Signs the router's challenge and stores the new API key in `~/.config/floprouter/config.json` (mode 600). Options: `--name`, `--payer grant\|credit`, `--show-key`, `--no-save` |
 | `keys`, `keys revoke <id>`, `keys payer <id> grant\|credit` | Manage your API keys |
 | `logout` | Forget the stored key |
-| `grant` | Builds and signs `flopSessionKeys.createSession` for the router's delegate. It allows `ComputeChannel` only and shows the caps before you confirm. Options: `--spending-cap --per-tx --daily-cap --days --revoke --status --yes` |
+| `grant` | Builds and signs `flopSessionKeys.createSession` for the router's delegate. It allows `ComputeChannel` only and shows the caps before you confirm. While a grant is active, it signs the renewal instead: `revokeSession` and `createSession` in one transaction. Options: `--spending-cap --per-tx --daily-cap --days --revoke --yes`; `--status [--json]`; `--auto-renew` (below) |
+| `miner endpoint <url>` | For miner operators: lists or changes the miner's session URL. It signs the router's endpoint challenge with the miner key on this machine, then prints the result: verified, not verified yet, unreachable, not verified, or rate limited. Works headless with `--key-file` and `--yes` |
+| `miner status [<address>]` | The miner's availability, health and last check. With an API key of the miner address (`floprouter login --key-file <miner key>`), it also shows the miner's own listed URLs |
 | `deposit <amount>` | Transfers FLOP from your wallet to the router's deposit address, after you confirm |
 | `withdraw <amount\|all>` | Sends prepaid balance back to the wallet that owns the key (the only destination allowed), after you confirm |
 
@@ -55,6 +57,23 @@ After each reply, a status line on stderr shows the session id, the miner, the c
 Wallet input: `--key-file <polkadot-js JSON>` (password prompted, or `--password-file`), `--seed-file <file>` (mnemonic, `0x` seed or secret URI), the environment variables `FLOPROUTER_KEY_FILE` / `FLOPROUTER_SEED_FILE`, or a hidden prompt. A seed or password is never accepted as a command-line argument. Use `--type ed25519` for ed25519 keys.
 
 Global options: `--base-url` (`FLOPROUTER_BASE_URL`, default `https://api.floprouter.com`) and `--json`. The API key comes from `FLOPROUTER_API_KEY`, or from the file written by `login`.
+
+## Keeping a grant alive (agents, cron)
+
+The chain needs the owner's signature for every grant, so the router cannot renew one; the wallet's own key can. Run this every hour from cron, a systemd timer, CI or an agent loop:
+
+```bash
+floprouter grant --auto-renew --key-file ./wallet.json --password-file ./wallet.pw --yes   # or --seed-file
+```
+
+- **When it renews.** It reads the grant from the router and renews only when the grant is missing, revoked or expired, expires within `--renew-before` (default `2d`), or has less than `--min-remaining` FLOP of its spending cap left (default: the per-session limit).
+- **When it does nothing.** In every other case it does nothing and exits 0. Before it signs, it confirms the state on chain, so a second run never renews twice.
+- **What it signs.** A renewal is `revokeSession` plus `createSession` in one `utility.batchAll` with the current caps; a missing grant gets a new `createSession`. When the router describes the renewal, the CLI checks the description is exactly that batch.
+- **Room versus time.** The chain carries the amount already spent over a renewal. When the reason is the spending cap, the new cap is the previous cap plus the amount spent, which keeps the same room. A low allowance for today is reported but never renewed: it returns on its own at the next daily epoch.
+- **Keys.** It never prompts, and it refuses to run without `--key-file` or `--seed-file` (or `FLOPROUTER_KEY_FILE` / `FLOPROUTER_SEED_FILE`), and without `--yes` when there is no terminal.
+- **Script output.** `--json` prints `{action: skip|wait|grant|renew, reason, tx, ...}`; `--dry-run` shows what it would sign. `floprouter grant --status --json` returns the facts and what `--auto-renew` would do now.
+- **Ready-made jobs:** `examples/keep-grant-alive.sh` (a cron line) and `examples/js/keep_grant_alive.mjs` (for agent frameworks).
+- **The chain endpoint** comes from the router (`rpc` in `/v1/grants/params` or `/health`); `--rpc` is only for overriding it.
 
 ## Safety checks before signing
 

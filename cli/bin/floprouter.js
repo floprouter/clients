@@ -5,7 +5,7 @@ import { makeClient, DEFAULT_BASE_URL } from '../src/api.js';
 import { configPath, dim, err, readConfig, red, writeConfig } from '../src/io.js';
 import * as cmd from '../src/commands.js';
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 
 const HELP = `floprouter ${VERSION}: the floprouter API from the command line (chat with FLOP Network miners, paid in FLOP)
 
@@ -17,8 +17,13 @@ Browse (no key needed)
       --reachable --ready --calibrated --model <id> --min-score <n>
       --sort score|settle_rate|sessions|stake|latency|capacity --order asc|desc
       --limit <n> --offset <n> --all
-  miner <address>                          one miner in detail
+  miner <address>                          one miner in detail (availability, health, last check)
   status                                   router health, network, payer
+
+Miner operators (sign with the miner key locally; works headless with --key-file and --yes)
+  miner endpoint <https://host[:port]>     prove control of the miner account and list or change its session URL
+      --key-file <miner key> | --seed-file <file>  [--password-file <file>] [--yes] [--json]
+  miner status [<address>]                 your listing: availability, health, last check; your URLs with a key of the miner
 
 Use (needs an API key)
   chat [prompt]                            one-shot if a prompt is given or piped, interactive otherwise
@@ -46,12 +51,15 @@ Wallet (signs locally; keys never leave this machine)
   logout                                   forget the stored API key
   grant                                    sign the one-time session-key grant (you stay the on-chain payer)
       --spending-cap <FLOP> --per-tx <FLOP> --daily-cap <FLOP> --days <n> --fee-float <FLOP> --max-float <FLOP>
-      --revoke --status
+      --revoke --status [--json]
+      --auto-renew [--renew-before 2d] [--min-remaining <FLOP>] [--min-daily <FLOP>] [--dry-run] [--json]
+                         renew only when needed (missing, revoked, expiring, nearly used up); for cron and agents
   deposit <amount>                         transfer FLOP from your wallet to your router balance
 
   Wallet options: --key-file <polkadot-js JSON>  or  --seed-file <file with mnemonic/seed>
                   (or FLOPROUTER_KEY_FILE / FLOPROUTER_SEED_FILE; otherwise a hidden prompt)
-                  --password-file <file> --type sr25519|ed25519 --rpc <wss://...> --yes
+                  --password-file <file> --type sr25519|ed25519 --yes
+                  --rpc <wss://...>  only to override the chain endpoint the router names
 
 Global: --base-url <url> (FLOPROUTER_BASE_URL, default ${DEFAULT_BASE_URL})  --api-key-env <NAME>  --json
 API key: FLOPROUTER_API_KEY, else the one saved by \`login\` in ${configPath()}
@@ -67,7 +75,7 @@ const options = {
   'max-tokens': { type: 'string' }, system: { type: 'string' }, wait: { type: 'boolean' }, payer: { type: 'string' },
   name: { type: 'string' }, 'show-key': { type: 'boolean' }, 'no-save': { type: 'boolean' }, 'wrap-bytes': { type: 'boolean' }, show: { type: 'boolean' },
   'spending-cap': { type: 'string' }, 'per-tx': { type: 'string' }, 'daily-cap': { type: 'string' }, days: { type: 'string' },
-  'fee-float': { type: 'string' }, 'max-float': { type: 'string' }, revoke: { type: 'boolean' }, status: { type: 'boolean' },
+  'fee-float': { type: 'string' }, 'max-float': { type: 'string' }, 'auto-renew': { type: 'boolean' }, 'dry-run': { type: 'boolean' }, 'renew-before': { type: 'string' }, 'min-remaining': { type: 'string' }, 'min-daily': { type: 'string' }, revoke: { type: 'boolean' }, status: { type: 'boolean' },
   'key-file': { type: 'string' }, 'seed-file': { type: 'string' }, 'password-file': { type: 'string' }, type: { type: 'string' }, rpc: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
 };
 
@@ -88,7 +96,7 @@ async function main() {
   switch (command) {
     case 'models': return cmd.models(ctx, o);
     case 'miners': return cmd.miners(ctx, o);
-    case 'miner': return cmd.miner(ctx, o, rest[0]);
+    case 'miner': return cmd.miner(ctx, o, rest[0], rest.slice(1));
     case 'status': case 'health': return cmd.health(ctx, o);
     case 'chat': return cmd.chat(ctx, o, rest);
     case 'session': case 'sessions': return cmd.session(ctx, o, rest[0]);
@@ -108,7 +116,7 @@ async function main() {
   }
 }
 
-main().then(() => process.exit(0), (e) => {
+main().then(() => process.exit(process.exitCode ?? 0), (e) => {
   err(red(cmd.describe(e)));
   if (process.env.FLOPROUTER_DEBUG) err(dim(e?.stack ?? ''));
   process.exit(1);

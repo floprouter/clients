@@ -28,7 +28,7 @@ function checkFileMode(file) {
  * a 0x seed or a secret URI), FLOPROUTER_KEY_FILE / FLOPROUTER_SEED_FILE, else a hidden prompt for the mnemonic.
  * A seed is never accepted as a command-line argument.
  */
-export async function loadSigner({ keyFile, seedFile, passwordFile, type = 'sr25519' } = {}) {
+export async function loadSigner({ keyFile, seedFile, passwordFile, type = 'sr25519', noPrompt = false } = {}) {
   const { keyring: { Keyring } } = await lib();
   const kr = new Keyring({ type, ss58Format: 42 });
   keyFile ??= process.env.FLOPROUTER_KEY_FILE;
@@ -40,6 +40,7 @@ export async function loadSigner({ keyFile, seedFile, passwordFile, type = 'sr25
     const encrypted = Array.isArray(json?.encoding?.type) ? !json.encoding.type.includes('none') : true;
     let password = '';
     if (encrypted) {
+      if (!passwordFile && noPrompt) throw new Error(`${keyFile} is encrypted: pass --password-file (no prompts in this mode)`);
       password = passwordFile ? fs.readFileSync(passwordFile, 'utf8').replace(/\r?\n$/, '') : await askHidden(`Password for ${pair.address}: `);
     }
     pair.decodePkcs8(password);
@@ -47,6 +48,7 @@ export async function loadSigner({ keyFile, seedFile, passwordFile, type = 'sr25
   }
   let suri;
   if (seedFile) { checkFileMode(seedFile); suri = fs.readFileSync(seedFile, 'utf8').trim(); }
+  else if (noPrompt) throw new Error('no --key-file or --seed-file given (no prompts in this mode)');
   else suri = (await askHidden('Mnemonic, 0x seed or secret URI (input hidden): ')).trim();
   if (!suri) throw new Error('empty seed');
   return kr.addFromUri(suri);

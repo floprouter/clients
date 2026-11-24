@@ -1,9 +1,11 @@
 // floprouter CLI commands.
 import readline from 'node:readline';
 import { ApiError, costOf, headersOf, isMissingRoute, modelFacts } from './api.js';
-import { bold, confirm, dim, err, flopAmount, green, pct, printJson, red, short, table, writeConfig, yellow } from './io.js';
+import { ALLOWED_PALLETS, checkGrantParams, checkRenewalCall, decideRenewal, grantFacts, grantOf, parseDuration, readGrantParams, renewIfDue } from './renewal.js';
 
-const ALLOWED_PALLETS = ['ComputeChannel'];
+export { decideRenewal, grantFacts, parseDuration, readGrantParams };
+import { bold, confirm, dim, err, flopAmount, green, pct, printJson, readConfig, red, short, table, writeConfig, yellow } from './io.js';
+
 const MAX_FLOAT_DEFAULT = '1';
 
 // ---- read-only ---------------------------------------------------------------------------------------------------
@@ -41,19 +43,23 @@ export async function miners(ctx, o) {
     sessions: m.history ? `${m.history.settled}/${m.history.sessions_resolved}` : null, strikes: m.slashing?.strikes,
     stake: flopAmount(m.stake?.total), cal: m.calibration?.live ? 'yes' : 'no',
     models: (m.models ?? []).map((x) => x.id ?? x).join(','),
-    reach: m.router_measured?.reachable ? green('yes') : 'no', ready: m.router_measured?.ready ? green('yes') : 'no',
+    reach: m.availability ? (m.availability === 'available' ? green('available') : m.availability.replace('_', ' '))
+      : (m.router_measured?.reachable ? green('yes') : 'no'),
+    ready: m.health ? (m.health === 'unknown' ? '-' : m.health) : (m.router_measured?.ready ? green('yes') : 'no'),
   }));
   console.log(table(rows, [
     { key: 'rank', title: 'RANK', right: true }, { key: 'address', title: 'MINER' }, { key: 'score', title: 'SCORE', right: true },
     { key: 'settle', title: 'SETTLE', right: true }, { key: 'sessions', title: 'SETTLED', right: true }, { key: 'strikes', title: 'STRIKES', right: true },
-    { key: 'stake', title: 'STAKE', right: true }, { key: 'cal', title: 'CALIB' }, { key: 'reach', title: 'REACH' }, { key: 'ready', title: 'READY' },
+    { key: 'stake', title: 'STAKE', right: true }, { key: 'cal', title: 'CALIB' }, { key: 'reach', title: 'AVAILABILITY' }, { key: 'ready', title: 'HEALTH' },
     { key: 'models', title: 'MODELS' },
   ]));
-  console.log(dim(`\n${rows.length} of ${r.total ?? rows.length} miners${r.finalized_block ? ` at block ${r.finalized_block}` : ''}. Score 0-100 from on-chain facts; REACH/READY measured by the router.`));
+  console.log(dim(`\n${rows.length} of ${r.total ?? rows.length} miners${r.finalized_block ? ` at block ${r.finalized_block}` : ''}. Score 0-100 from on-chain facts; AVAILABILITY and HEALTH measured by the router.`));
 }
 
-export async function miner(ctx, o, address) {
-  if (!address) throw new Error('usage: floprouter miner <address>');
+export async function miner(ctx, o, address, rest = []) {
+  if (address === 'endpoint' || address === 'register') return minerEndpoint(ctx, o, rest[0]);
+  if (address === 'status') return minerStatus(ctx, o, rest[0]);
+  if (!address) throw new Error('usage: floprouter miner <address> | miner endpoint <url> --key-file <miner key> | miner status');
   if (!/^[1-9A-HJ-NP-Za-km-z]{47,48}$/.test(address)) throw new Error(`${address} is not a miner address (SS58, 47 or 48 characters)`);
   const m = await ctx.api.get(`/v1/miners/${encodeURIComponent(address)}`, { auth: false });
   if (o.json) return printJson(m);
@@ -68,8 +74,16 @@ export async function miner(ctx, o, address) {
   kv('calibration', m.calibration?.live ? `live, ${m.calibration.cap_gflops_per_sec} GFLOP/s, tier ${m.calibration.tier}` : 'not live');
   kv('slashing', m.slashing ? `strikes ${m.slashing.strikes}, failed acks ${m.slashing.failed_acks}, failed offer opens ${m.slashing.failed_offer_opens}` : '-');
   kv('models', (m.models ?? []).map((x) => `${x.id ?? x.name} [${(x.evidence ?? []).join(', ')}]`).join('; '));
-  kv('router measured', `reachable ${rm.reachable ? 'yes' : 'no'}, ready ${rm.ready ? 'yes' : 'no'}, first output ${rm.first_output_ms ?? '-'} ms, success ${pct(rm.session_success_rate) ?? '-'}`);
-  for (const e of m.endpoints ?? []) kv('endpoint', `${e.url} ${e.status}${e.ready ? ' ready' : ''} ${e.model ?? ''} (probe ${pct(e.probe_success_rate) ?? '-'}, ${e.proof_latency_ms ?? '-'} ms)`);
+  if (m.availability) {
+    // Endpoint URLs are not public; the router reports availability and health instead.
+    kv('availability', `${m.availability.replace('_', ' ')}${m.health && m.health !== 'unknown' ? `, health ${m.health}` : m.health === 'unknown' ? ', health: not enough data' : ''}`);
+    if (m.last_checked_at) kv('last checked', m.last_checked_at);
+    if (m.recent) kv('recent', `success ${pct(m.recent.success_rate) ?? 'not enough data'}, median first output ${m.recent.first_output_ms_median ?? '-'} ms`);
+  } else {
+    kv('router measured', `reachable ${rm.reachable ? 'yes' : 'no'}, ready ${rm.ready ? 'yes' : 'no'}, first output ${rm.first_output_ms ?? '-'} ms, success ${pct(rm.session_success_rate) ?? '-'}`);
+    for (const e of m.endpoints ?? []) kv('endpoint', `${e.url ? `${e.url} ` : ''}${e.status}${e.ready ? ' ready' : ''} ${e.model ?? ''} (probe ${pct(e.probe_success_rate) ?? '-'}, ${e.proof_latency_ms ?? '-'} ms)`);
+  }
+  if (m.own_listing) printOwnListing(m.own_listing, kv);
   if (m.recent_channels?.length) kv('recent channels', `${m.recent_channels.length} (use --json for the list)`);
   if (m.links?.account) kv('explorer', m.links.account);
 }
@@ -336,14 +350,8 @@ export async function balance(ctx, o) {
   }
 }
 
-function activeGrant(g, delegate) {
-  let list = Array.isArray(g?.data) ? g.data : Array.isArray(g) ? g : g ? [g] : [];
-  if (delegate) list = list.filter((x) => !x.delegate || x.delegate === delegate);
-  return list.find((x) => x.state === 'waiting_for_finality') ?? list.find((x) => x.active) ?? list[0] ?? null;
-}
-
 function describeGrant(g) {
-  const x = activeGrant(g);
+  const x = grantOf(g);
   if (x?.state === 'waiting_for_finality') {
     const pnd = x.pending ?? {};
     return yellow(`waiting for finality: in block ${pnd.best_block ?? '?'}, final up to ${pnd.finalized_block ?? '?'}; reads as ${pnd.at_best ?? 'the new state'} once final`);
@@ -372,47 +380,15 @@ async function chainContext(ctx, o, hint) {
 
 const pick = (...xs) => xs.find((x) => x !== undefined && x !== null && x !== '');
 
-/**
- * Normalises GET /v1/grants/params. The router suggests; the CLI builds the extrinsic itself from these values and
- * checks them, and never signs call data supplied by the server.
- */
-export function readGrantParams(p) {
-  const call = p.call ?? null;
-  const args = Array.isArray(call?.args) ? call.args : null;
-  const a = p.amounts ?? p.suggested ?? {};
-  const l = p.limits ?? {};
-  return {
-    owner: p.owner ?? null,
-    delegate: pick(p.delegate, args?.[0]),
-    rpc: pick(p.rpc, Array.isArray(p.rpc_urls) ? p.rpc_urls[0] : undefined),
-    genesis: pick(p.genesis_hash, p.genesis),
-    callPallet: call ? String(call.pallet ?? '') : null,
-    callMethod: call ? String(call.method ?? '') : null,
-    argDelegate: args?.[0] ?? null,
-    argRaw: args ? { cap: args[1], tx: args[2], day: args[3], duration: args[4] } : null,
-    allowedPallets: pick(args?.[5], l.allowed_pallets),
-    spendingCap: pick(a.spending_cap), perTxLimit: pick(a.per_tx_limit), dailyCap: pick(a.daily_cap),
-    durationBlocks: pick(a.duration_blocks, args?.[4]), feeFloat: pick(a.fee_float, p.fee_float),
-    maxDurationBlocks: pick(l.max_session_duration_blocks, l.max_duration_blocks),
-    renewal: p.renewal === true, renewalCall: p.renewal_call ?? null,
-  };
-}
-
-export async function grant(ctx, o) {
+export async function grant(ctx, o, preset = {}) {
   if (o.status) return grantStatus(ctx, o);
+  if (o['auto-renew']) return autoRenew(ctx, o);
+  const say = preset.say ?? ((m) => console.log(m));
   const { loadSigner, toRaw, fromRaw, signAndWait, isValidAddress } = await import('./wallet.js');
-  const pair = await loadSigner(signerOpts(o));
-  const p = readGrantParams(await ctx.api.get('/v1/grants/params', { query: ctx.api.hasKey ? {} : { address: pair.address } }));
-  if (!p.delegate || !(await isValidAddress(p.delegate))) throw new Error(`router named no valid delegate address (${p.delegate})`);
-  if (p.owner && p.owner !== pair.address) throw new Error(`these grant parameters are for ${p.owner}, but the key you loaded is ${pair.address}`);
-  if (p.callPallet && (p.callPallet !== 'flopSessionKeys' || p.callMethod !== 'createSession')) {
-    throw new Error(`router asks for ${p.callPallet}.${p.callMethod}; this CLI only signs flopSessionKeys.createSession`);
-  }
-  if (p.argDelegate && p.argDelegate !== p.delegate) throw new Error('router named two different delegates; refusing to sign');
-  if (p.allowedPallets && JSON.stringify(p.allowedPallets) !== JSON.stringify(ALLOWED_PALLETS)) {
-    throw new Error(`router suggests allowed pallets ${JSON.stringify(p.allowedPallets)}; this CLI only grants ${JSON.stringify(ALLOWED_PALLETS)}`);
-  }
-  const { api } = await chainContext(ctx, o, p);
+  const pair = preset.pair ?? await loadSigner(signerOpts(o));
+  const p = preset.params ?? readGrantParams(await ctx.api.get('/v1/grants/params', { query: ctx.api.hasKey ? {} : { address: pair.address } }));
+  checkGrantParams(p, pair.address, await isValidAddress(p.delegate ?? ''));
+  const { api } = preset.chain ?? await chainContext(ctx, o, p);
   try {
     const blocksPerHour = Number(api.consts.flopSessionKeys?.blocksPerHour?.toString() ?? 3600);
     const chainMax = Number(api.consts.flopSessionKeys?.maxSessionDuration?.toString() ?? 864000);
@@ -423,16 +399,16 @@ export async function grant(ctx, o) {
       if (existing.isNone) { err('no grant to this router delegate on chain'); return; }
       err(`Revoke the grant from ${pair.address} to the router delegate ${p.delegate}.`);
       if (!(await confirm('Sign and submit?', o))) return err('cancelled');
-      const r = await signAndWait(api, api.tx.flopSessionKeys.revokeSession(p.delegate), pair, (s) => err(dim(`  ${s}`)));
+      const r = await signAndWait(api, api.tx.flopSessionKeys.revokeSession(p.delegate), pair, (st) => err(dim(`  ${st}`)));
       err(green(`revoked in block ${r.block} (tx ${r.tx})`));
       await syncGrant(ctx, { delegate: p.delegate, expect: 'gone' });
       return;
     }
 
     const want = {
-      spendingCap: String(pick(o['spending-cap'], p.spendingCap, '5')),
-      perTxLimit: String(pick(o['per-tx'], p.perTxLimit, '0.5')),
-      dailyCap: String(pick(o['daily-cap'], p.dailyCap, '2')),
+      spendingCap: String(pick(o['spending-cap'], preset.caps?.spendingCap, p.spendingCap, '5')),
+      perTxLimit: String(pick(o['per-tx'], preset.caps?.perTxLimit, p.perTxLimit, '0.5')),
+      dailyCap: String(pick(o['daily-cap'], preset.caps?.dailyCap, p.dailyCap, '2')),
       durationBlocks: o.days ? Math.round(Number(o.days) * 24 * blocksPerHour) : Number(pick(p.durationBlocks, maxDur)),
       feeFloat: String(pick(o['fee-float'], p.feeFloat, '0')),
     };
@@ -440,8 +416,9 @@ export async function grant(ctx, o) {
     const raw = { cap: await toRaw(api, want.spendingCap), tx: await toRaw(api, want.perTxLimit), day: await toRaw(api, want.dailyCap), float: await toRaw(api, want.feeFloat) };
     if (raw.cap <= 0n || raw.tx <= 0n || raw.day <= 0n) throw new Error('caps must be positive');
     if (raw.tx > raw.cap || raw.day > raw.cap) throw new Error('per-transaction and daily caps cannot exceed the spending cap');
-    // The router's own call must say the same as its amounts (unless the user overrode them on purpose).
-    if (p.argRaw && !o['spending-cap'] && !o['per-tx'] && !o['daily-cap'] && p.spendingCap
+    // The router's own call must say the same as its amounts (unless the caps were chosen here on purpose).
+    const ownCaps = o['spending-cap'] || o['per-tx'] || o['daily-cap'] || preset.caps;
+    if (p.argRaw && !ownCaps && p.spendingCap
       && (String(p.argRaw.cap) !== raw.cap.toString() || String(p.argRaw.tx) !== raw.tx.toString() || String(p.argRaw.day) !== raw.day.toString())) {
       throw new Error('the router\'s call arguments do not match its stated amounts; refusing to sign');
     }
@@ -453,8 +430,12 @@ export async function grant(ctx, o) {
     const create = api.tx.flopSessionKeys.createSession(p.delegate, raw.cap, raw.tx, raw.day, want.durationBlocks, ALLOWED_PALLETS);
     // The chain refuses a second createSession while a grant to the same delegate is active
     // (SessionAlreadyExists), so a renewal is revokeSession + createSession in one batchAll: one signature, and
-    // if either part fails nothing changes. Built here, from the chain's own state, not from server call data.
+    // if either part fails nothing changes. Built here, from the chain's own state; the router's renewal_call, when it
+    // sends one, must describe exactly that batch.
     if (active && p.renewalCall) checkRenewalCall(p.renewalCall, p.delegate);
+    if (active && p.renewal === false && p.renewalCall === null && 'renewal' in (p.raw ?? {})) {
+      err(dim('the router does not see the active grant yet (it reads its finalized block); renewing from the chain state'));
+    }
     const calls = [...(active ? [api.tx.flopSessionKeys.revokeSession(p.delegate)] : []), create,
       ...(raw.float > 0n ? [api.tx.balances.transferKeepAlive(p.delegate, raw.float)] : [])];
     const tx = calls.length === 1 ? calls[0] : api.tx.utility.batchAll(calls);
@@ -462,32 +443,69 @@ export async function grant(ctx, o) {
     const hours = want.durationBlocks / blocksPerHour;
     const span = hours < 48 ? `${hours.toFixed(1)} hours` : `${(hours / 24).toFixed(1)} days`;
     const acct = await api.query.system.account(pair.address);
-    console.log(bold('\nSession-key grant'));
-    console.log(`  your wallet (payer)   ${pair.address}  balance ${fromRaw(api, acct.data.free.toString())} FLOP`);
-    console.log(`  router delegate       ${p.delegate}`);
-    console.log(`  allowed               ${ALLOWED_PALLETS.join(', ')} only (compute channels; no transfers)`);
-    console.log(`  spending cap          ${want.spendingCap} FLOP in total`);
-    console.log(`  per session           ${want.perTxLimit} FLOP at most`);
-    console.log(`  per day               ${want.dailyCap} FLOP at most`);
-    console.log(`  duration              ${want.durationBlocks} blocks (about ${span})`);
-    if (raw.float > 0n) console.log(`  fee float             ${want.feeFloat} FLOP sent to the delegate for its transaction fees`);
-    if (active) console.log(`  renews                your active grant: revoke and new grant in one transaction (one signature)`);
-    console.log(dim('  Within these caps the router opens compute channels that your wallet pays for. Revoke any time:'));
-    console.log(dim('  floprouter grant --revoke\n'));
-    if (!(await confirm('Sign and submit?', o))) return err('cancelled');
-    const r = await signAndWait(api, tx, pair, (s) => err(dim(`  ${s}`)));
+    say(bold(`\nSession-key grant${active ? ' renewal' : ''}`));
+    say(`  your wallet (payer)   ${pair.address}  balance ${fromRaw(api, acct.data.free.toString())} FLOP`);
+    say(`  router delegate       ${p.delegate}`);
+    say(`  allowed               ${ALLOWED_PALLETS.join(', ')} only (compute channels; no transfers)`);
+    say(`  spending cap          ${want.spendingCap} FLOP in total`);
+    say(`  per session           ${want.perTxLimit} FLOP at most`);
+    say(`  per day               ${want.dailyCap} FLOP at most`);
+    say(`  duration              ${want.durationBlocks} blocks (about ${span})`);
+    if (raw.float > 0n) say(`  fee float             ${want.feeFloat} FLOP sent to the delegate for its transaction fees`);
+    if (active) say(`  renews                your active grant: revoke and new grant in one transaction (one signature)`);
+    if (preset.reason) say(`  why                   ${preset.reason}`);
+    say(dim('  Within these caps the router opens compute channels that your wallet pays for. Revoke any time:'));
+    say(dim('  floprouter grant --revoke\n'));
+    if (!(await confirm('Sign and submit?', o))) { err('cancelled'); return null; }
+    const r = await signAndWait(api, tx, pair, (st) => err(dim(`  ${st}`)));
     pair.lock?.();
-    err(green(`grant finalized in block ${r.block} (tx ${r.tx})`));
+    err(green(`grant ${active ? 'renewed' : 'created'}, finalized in block ${r.block} (tx ${r.tx})`));
     // A renewal replaces an active grant, so "active" alone could still be the old one: wait for the new cap.
-    await syncGrant(ctx, { delegate: p.delegate, expect: 'active', cap: want.spendingCap });
-  } finally { await api.disconnect(); }
+    await syncGrant(ctx, { delegate: p.delegate, expect: 'active', cap: want.spendingCap, maxMs: preset.syncMaxMs });
+    return { tx: r.tx, block: r.block, renewed: active, caps: want };
+  } finally { if (!preset.chain) await api.disconnect(); }
+}
+
+/**
+ * --auto-renew: safe to run every hour from cron, a systemd timer, CI or an agent loop. The shared flow in renewal.js
+ * reads the grant from the router, does nothing (exit 0) while it is healthy, otherwise confirms the state on chain and
+ * signs one transaction with the wallet's own key: a new grant, or revokeSession + createSession in one batchAll with
+ * the current caps (or the caps given as flags). Never prompts for a key.
+ */
+export async function autoRenew(ctx, o) {
+  const keyGiven = o['key-file'] || o['seed-file'] || process.env.FLOPROUTER_KEY_FILE || process.env.FLOPROUTER_SEED_FILE;
+  if (!keyGiven) throw new Error('--auto-renew needs --key-file or --seed-file (or FLOPROUTER_KEY_FILE / FLOPROUTER_SEED_FILE); it never prompts for a key');
+  if (!o.yes && !process.stdin.isTTY) throw new Error('--auto-renew without a terminal needs --yes');
+  if (!ctx.api.hasKey) throw new Error('--auto-renew reads the grant from the router: run `floprouter login` or set FLOPROUTER_API_KEY');
+  const caps = o['spending-cap'] || o['per-tx'] || o['daily-cap']
+    ? { spendingCap: String(o['spending-cap'] ?? ''), perTxLimit: String(o['per-tx'] ?? ''), dailyCap: String(o['daily-cap'] ?? '') } : null;
+  if (caps && (!caps.spendingCap || !caps.perTxLimit || !caps.dailyCap)) throw new Error('to change the caps on renewal give all three: --spending-cap, --per-tx and --daily-cap');
+  const wallet = await import('./wallet.js');
+  const r = await renewIfDue({
+    client: ctx.api, wallet, key: signerOpts(o), rpc: o.rpc, days: o.days, caps, sameCaps: !caps, keepHeadroom: true, allowCreate: true, dryRun: Boolean(o['dry-run']),
+    opts: { renewBeforeSec: parseDuration(o['renew-before'] ?? '2d'), minRemaining: o['min-remaining'] !== undefined ? Number(o['min-remaining']) : null,
+      minDaily: o['min-daily'] !== undefined ? Number(o['min-daily']) : null },
+    log: (m) => err(dim(m)),
+  });
+  if (r.action === 'skip' || r.action === 'wait') err(`${r.action === 'skip' ? 'grant ok' : 'grant pending'}: ${r.reason}. Nothing to do.`);
+  if (r.note) err(yellow(r.note));
+  else if (r.dry_run) err(yellow(`would ${r.action} (${r.reason}); --dry-run, nothing signed`));
+  else if (r.tx) err(green(`${r.action === 'renew' ? 'renewed' : 'granted'} (${r.reason}): tx ${r.tx}, block ${r.block}`));
+  if (o.json) printJson(r);
+  if (r.action === 'refused') throw new Error(r.reason);
 }
 
 async function grantStatus(ctx, o) {
   const g = ctx.api.hasKey ? await ctx.api.post('/v1/grants/sync', {}) : null;
   if (!g) throw new Error('needs an API key: run `floprouter login`');
-  if (o.json) return printJson(g);
+  const x = grantOf(g);
+  const f = grantFacts(g, x?.delegate);
+  const d = decideRenewal(f, { renewBeforeSec: parseDuration(o['renew-before'] ?? '2d'),
+    minRemaining: o['min-remaining'] !== undefined ? Number(o['min-remaining']) : null, minDaily: o['min-daily'] !== undefined ? Number(o['min-daily']) : null });
+  // Stable shape for scripts: the facts in plain numbers, and what --auto-renew would do now.
+  if (o.json) return printJson({ address: g.address ?? null, ...f, needs_renewal: d.action === 'grant' || d.action === 'renew', auto_renew_action: d.action, reason: d.reason });
   console.log(describeGrant(g));
+  if (d.action !== 'skip') console.log(dim(`auto-renew would ${d.action}: ${d.reason}`));
 }
 
 /**
@@ -500,7 +518,7 @@ async function syncGrant(ctx, { delegate, expect, cap, maxMs = 180_000, everyMs 
   const t0 = Date.now(); let said = false; let g = null;
   for (;;) {
     try { g = await ctx.api.post('/v1/grants/sync', {}); } catch (e) { err(yellow(`the router could not read the grant yet: ${describe(e)}`)); return; }
-    const x = activeGrant(g, delegate);
+    const x = grantOf(g, delegate);
     const state = x?.state ?? 'none';
     const done = expect === 'active' ? state === 'active' && x.active !== false && (cap === undefined || Number(x.spending_cap) === Number(cap))
       : state !== 'waiting_for_finality' && !(x?.active === true && state === 'active');
@@ -511,16 +529,6 @@ async function syncGrant(ctx, { delegate, expect, cap, maxMs = 180_000, everyMs 
     if (!said) { err(dim('waiting for the router to read it at its finalized block...')); said = true; }
     await new Promise((r) => setTimeout(r, everyMs));
   }
-}
-
-/** The server's renewal description, if any, must be exactly revokeSession(delegate) + createSession(delegate, ...). */
-function checkRenewalCall(rc, delegate) {
-  const calls = rc?.calls ?? [];
-  const ok = rc?.pallet === 'utility' && rc?.method === 'batchAll' && calls.length === 2
-    && calls[0]?.pallet === 'flopSessionKeys' && calls[0]?.method === 'revokeSession' && calls[0]?.args?.[0] === delegate
-    && calls[1]?.pallet === 'flopSessionKeys' && calls[1]?.method === 'createSession' && calls[1]?.args?.[0] === delegate
-    && JSON.stringify(calls[1]?.args?.[5]) === JSON.stringify(ALLOWED_PALLETS);
-  if (!ok) throw new Error('the router describes a renewal other than revokeSession + createSession for its delegate; refusing to sign');
 }
 
 export async function deposit(ctx, o, args) {
@@ -549,6 +557,79 @@ export async function deposit(ctx, o, args) {
     pair.lock?.();
     err(green(`transfer finalized in block ${r.block} (tx ${r.tx}). Check with: floprouter balance`));
   } finally { await api.disconnect(); }
+}
+
+// ---- miner operators: list an endpoint, see the own listing ------------------------------------------------------
+
+function printOwnListing(ol, kv) {
+  const list = Array.isArray(ol) ? ol : Array.isArray(ol?.endpoints) ? ol.endpoints : Array.isArray(ol?.data) ? ol.data : [];
+  if (!list.length) return kv('your listing', 'no endpoint listed (floprouter miner endpoint <url> --key-file <miner key>)');
+  for (const e of list) kv('your endpoint', `${e.url} ${e.status ?? ''}${e.ready ? ', ready' : ''}${e.model ? `, ${e.model}` : ''}${e.verified_at ? `, verified ${e.verified_at}` : ''}${e.last_checked_at ? `, checked ${e.last_checked_at}` : ''}`);
+}
+
+/** Plain words for the answer to an endpoint submission. */
+export function describeSubmission(status, body) {
+  const reason = body?.error?.metadata?.reason ?? (typeof body?.error?.code === 'string' ? body.error.code : null) ?? body?.status;
+  const msg = body?.message ?? body?.error?.message ?? '';
+  if (status === 200) return { ok: true, word: 'verified', text: `verified: the endpoint is listed and routable${body?.model ? ` (serves ${body.model})` : ''}. ${msg}`.trim() };
+  if (status === 202) return { ok: true, word: 'not verified yet', text: `recorded, not routable yet: ${msg}` };
+  if (status === 422 && /unreachable/.test(reason ?? '')) return { ok: false, word: 'unreachable', text: `unreachable: the router could not reach the endpoint. ${msg}`.trim() };
+  if (status === 422) return { ok: false, word: 'not verified', text: `not verified: ${msg}` };
+  if (status === 429) return { ok: false, word: 'rate limited', text: `rate limited${reason === 'too_many_pending' ? ' (too many endpoints recorded but not routable)' : ''}: ${msg}` };
+  if (status === 401) return { ok: false, word: 'refused', text: `refused (${reason}): ${msg}` };
+  return { ok: false, word: 'failed', text: `HTTP ${status} ${reason ?? ''}: ${msg}`.trim() };
+}
+
+/**
+ * `floprouter miner endpoint <url>`: proves control of the miner account by signing the router's endpoint challenge
+ * with the miner key (raw bytes, like `login`), then submits the URL. Works headless with --key-file and --yes.
+ */
+export async function minerEndpoint(ctx, o, url) {
+  if (!url) throw new Error('usage: floprouter miner endpoint <https://host[:port]> --key-file <miner key> [--yes]');
+  let u; try { u = new URL(url); } catch { throw new Error(`${url} is not a URL`); }
+  if (u.protocol !== 'https:' || (u.pathname !== '/' && u.pathname !== '') || u.search || u.hash) throw new Error('the endpoint must be https://host[:port] with no path');
+  const clean = `https://${u.host.toLowerCase()}`;
+  const headless = !process.stdin.isTTY;
+  if (headless && !o.yes) throw new Error('without a terminal pass --yes (after checking the URL)');
+  const { loadSigner, signChallenge } = await import('./wallet.js');
+  const pair = await loadSigner({ ...signerOpts(o), noPrompt: headless });
+  const addr = pair.address;
+  const ch = await ctx.api.post(`/v1/miners/${addr}/endpoint/challenge`, { url: clean }, { auth: false });
+  const text = ch?.challenge;
+  // Sign only a challenge that is what it says: this miner, this URL, no funds moved.
+  if (typeof text !== 'string' || !text.includes(addr) || !text.includes(clean) || !/endpoint/i.test(text) || !/does not move funds/i.test(text) || /API key/i.test(text)) {
+    throw new Error('the router returned an unexpected challenge; refusing to sign');
+  }
+  err(`miner ${bold(addr)} lists ${bold(clean)}`);
+  err(dim(text.split(/;\s*/).map((l) => `  | ${l}`).join('\n')));
+  if (!(await confirm('Sign with the miner key and submit?', o))) return err('cancelled');
+  const signature = await signChallenge(pair, text, { wrap: Boolean(o['wrap-bytes']) });
+  pair.lock?.();
+  let status = 200; let body;
+  try { body = await ctx.api.post(`/v1/miners/${addr}/endpoint`, { url: clean, challenge: text, signature }, { auth: false }); status = body?.httpStatus ?? 200; }
+  catch (e) { if (!(e instanceof ApiError)) throw e; status = e.status; body = e.body; }
+  const d = describeSubmission(status, body);
+  if (o.json) printJson({ status, word: d.word, ...body });
+  (d.ok ? (m) => err(green(m)) : (m) => err(red(m)))(d.text);
+  if (!d.ok) process.exitCode = status === 429 ? 3 : 2;
+}
+
+/** `floprouter miner status [address]`: the miner's public entry, and its own listing when the API key is the miner's. */
+export async function minerStatus(ctx, o, address) {
+  let addr = address;
+  if (!addr && (o['key-file'] || o['seed-file'])) { const { loadSigner } = await import('./wallet.js'); addr = (await loadSigner({ ...signerOpts(o), noPrompt: true })).address; }
+  if (!addr) addr = readConfig().address;
+  if (!addr) throw new Error('usage: floprouter miner status [<address>] (or --key-file, or the address saved by login)');
+  const m = await ctx.api.get(`/v1/miners/${encodeURIComponent(addr)}`, { auth: ctx.api.hasKey });
+  if (o.json) return printJson({ address: m.address, availability: m.availability ?? null, health: m.health ?? null, last_checked_at: m.last_checked_at ?? null, recent: m.recent ?? null, own_listing: m.own_listing ?? null });
+  const kv = (k, v) => console.log(`${dim(k.padEnd(16))}${v ?? '-'}`);
+  console.log(bold(m.address));
+  kv('availability', m.availability ? m.availability.replace('_', ' ') : '-');
+  kv('health', m.health === 'unknown' ? 'not enough data yet' : m.health);
+  kv('last checked', m.last_checked_at);
+  if (m.recent) kv('recent', `success ${pct(m.recent.success_rate) ?? 'not enough data'}, median first output ${m.recent.first_output_ms_median ?? '-'} ms`);
+  if (m.own_listing) printOwnListing(m.own_listing, kv);
+  else kv('your listing', ctx.api.hasKey ? 'not shown: this API key is not the miner address (floprouter login --key-file <miner key>)' : 'not shown: needs an API key of the miner address (floprouter login --key-file <miner key>)');
 }
 
 // ---- generation, key, withdraw -----------------------------------------------------------------------------------

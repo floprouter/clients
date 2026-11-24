@@ -63,7 +63,7 @@ for (const format of ['old', 'new']) {
     env: { ...process.env, FLOPROUTER_BASE_URL: `http://127.0.0.1:${srv.address().port}`, FLOPROUTER_API_KEY: 'fr_test', FLOPROUTER_CONFIG: '/nonexistent', FLOPROUTER_TOOL_BUDGET_MS: '1500' } }));
   const call = async (name, args = {}) => { const r = await client.callTool({ name, arguments: args }); return { err: Boolean(r.isError), text: r.content[0].text }; };
   const names = (await client.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['account', 'chat', 'generation', 'get_miner', 'list_miners', 'list_models', 'router_status', 'session_status', 'withdraw']);
+  assert.deepEqual(names, ['account', 'chat', 'generation', 'get_miner', 'grant_status', 'list_miners', 'list_models', 'router_status', 'session_status', 'withdraw']);
   const models = JSON.parse((await call('list_models')).text).models[0];
   assert.equal(models.escrow_per_1000_tokens, '0.05'); assert.equal(models.miners_ready, 2);
   const chatR = await call('chat', { model: 'a/b', prompt: 'hi', fallback_models: ['c/d'] }); if (chatR.err) console.error(format, chatR.text);

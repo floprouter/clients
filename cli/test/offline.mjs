@@ -39,7 +39,7 @@ assert.equal(p.callMethod, 'createSession');
 assert.deepEqual(p.allowedPallets, ['ComputeChannel']);
 assert.equal(p.spendingCap, '5'); assert.equal(p.argRaw.cap, '5000000000000000000'); assert.equal(p.durationBlocks, 864000);
 // 5. help runs
-assert.match(execFileSync(process.execPath, [bin, 'help'], { encoding: 'utf8' }), /floprouter 0\.1\.1/);
+assert.match(execFileSync(process.execPath, [bin, 'help'], { encoding: 'utf8' }), /floprouter 0\.1\.2/);
 
 // 6. the CLI against a fake router in the earlier and the current API formats
 const http = await import('node:http');
