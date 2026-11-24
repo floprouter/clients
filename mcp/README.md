@@ -33,10 +33,37 @@ In HTTP mode, each request may carry its own key in `Authorization: Bearer fr_..
 | `generation` | One request by id: tokens, cost in FLOP, finish reason, latency, verified reply | no |
 | `session_status` | Settlement state of a session | no |
 | `account` | Balance (available, held, deposit address, fee, recent ledger, withdrawals), this key's usage and limits, grant state | no |
+| `grant_status` | The session-key grant: state, expiry, days left, cap left, today's room, whether renewal is due | no |
+| `renew_grant` | **Only in opt-in mode (below). Signs a transaction with the configured wallet.** Renews the grant when it is due, with the same caps | signs |
 | `withdraw` | Sends prepaid balance back to the wallet that owns the key | to the owner only |
 | `router_status` | Network, sync state and payer | no |
 
 `chat` returns once the miner's reply is verified, typically in 10 to 40 s (on devnet, often 1 to 2 minutes when a channel has to be opened without an offer). If that takes longer than the tool budget, it returns `pending: true` with the `generation_id`. The request carries on and can be read with `generation` a minute later. The on-chain settlement follows 2 to 5 minutes after the reply; check it with `session_status`.
+
+## Grant warnings and opt-in renewal
+
+By default this server never touches a wallet key. `chat` and `account` results carry a `grant_warning` when the grant has under 2 days left or is nearly used up, so the agent can tell its user in time. Only the user's wallet can sign a new grant, with `floprouter grant`, or unattended with `floprouter grant --auto-renew`.
+
+**Opt-in signing.** Set **both** a key file and the switch in the server's configuration, never in a tool call:
+
+| Variable | Meaning |
+| - | - |
+| `FLOPROUTER_KEY_FILE` (or `FLOPROUTER_SEED_FILE`) | The wallet that owns the API key. Add `FLOPROUTER_PASSWORD_FILE` if the key file is encrypted |
+| `FLOPROUTER_ALLOW_GRANT_RENEWAL=1` | Exposes `renew_grant` |
+| `FLOPROUTER_AUTO_RENEW=1` | Also renew automatically before a `chat` when the grant is due |
+| `FLOPROUTER_RENEW_BEFORE` | Renewal window, default `2d` |
+| `FLOPROUTER_SIGN_LOG` | Where each signature is logged (default `~/.config/floprouter/mcp-signatures.log`, mode 600). Each signature is also logged on stderr |
+
+Signing needs the polkadot packages, which the CLI brings: run the server as `npx -y -p floprouter -p floprouter-mcp floprouter-mcp`.
+
+`renew_grant` runs the same code as `floprouter grant --auto-renew` (one shared module), with stricter rules:
+
+- It renews only when due: expiring within the window, or expired.
+- It signs only `utility.batchAll[revokeSession, createSession]` to the router's delegate, with exactly the current caps and only `ComputeChannel`.
+- It never creates a grant from nothing and never raises a cap. A grant that is nearly used up is reported, and the user is asked to raise the cap themselves: the chain carries the amount spent over a renewal, so the same caps would not restore room.
+- It refuses any other renewal the router describes.
+- It never takes a key or seed as a tool argument.
+- `dry_run: true` shows what it would sign.
 
 ## Client configuration
 

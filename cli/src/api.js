@@ -67,7 +67,19 @@ export function makeClient({ baseUrl, apiKey, timeoutMs = 600_000, userAgent = '
     return { res, done: () => clearTimeout(timer) };
   }
 
-  async function request(method, path, opts) {
+  // Reads (and other idempotent calls marked `retry`) are retried twice on 502/503/504 and network errors, so an hourly
+  // job is not failed by a router restart. Chat and anything that spends is never retried here.
+  async function request(method, path, opts = {}) {
+    const retry = opts.retry ?? method === 'GET';
+    for (let attempt = 0; ; attempt++) {
+      try { return await requestOnce(method, path, opts); } catch (e) {
+        const transient = e instanceof ApiError && (e.status === 0 || e.status === 502 || e.status === 503 || e.status === 504) && e.code !== 'stream_interrupted';
+        if (!retry || !transient || attempt >= 2) throw e;
+        await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
+      }
+    }
+  }
+  async function requestOnce(method, path, opts) {
     const { res, done } = await raw(method, path, opts);
     try {
       const text = await res.text();

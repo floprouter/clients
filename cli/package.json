@@ -1,6 +1,6 @@
 {
   "name": "floprouter",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Command-line client for the floprouter API: FLOP Network miners and models, paid chat completions, and local wallet signing for login, grants, deposits and withdrawals",
   "author": "floprouter",
   "license": "MIT",
@@ -18,7 +18,7 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "test": "node test/offline.mjs",
+    "test": "node test/offline.mjs && node test/auto-renew.mjs && node test/miner-endpoint.mjs",
     "prepublishOnly": "node scripts/prepublish-check.mjs"
   },
   "keywords": [
