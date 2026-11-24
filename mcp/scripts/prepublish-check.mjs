@@ -13,7 +13,8 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 // 1. package.json metadata
 if (pkg.author !== 'floprouter') problems.push(`author must be "floprouter" (is ${JSON.stringify(pkg.author)})`);
-for (const k of ['contributors', 'maintainers', 'repository', 'bugs']) if (pkg[k] !== undefined) problems.push(`package.json must not carry "${k}" (no repository exists yet)`);
+for (const k of ['contributors', 'maintainers']) if (pkg[k] !== undefined) problems.push(`package.json must not carry "${k}"`);
+if (!pkg.repository || pkg.repository.url !== 'git+https://github.com/floprouter/clients.git') problems.push('package.json repository must be git+https://github.com/floprouter/clients.git (npm provenance checks it)');
 if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(pkg.version)) problems.push(`version ${pkg.version} is not semver`);
 for (const [name, spec] of Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies })) {
   if (/^(file:|link:|\.|\/|git|https?:)/.test(String(spec))) problems.push(`dependency ${name} points at ${spec}, not a registry version`);
