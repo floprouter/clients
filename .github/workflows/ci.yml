@@ -1,0 +1,51 @@
+# Checks on every push and pull request. No secrets are exposed to pull requests from forks (GitHub withholds them
+# from `pull_request` runs of forks); this workflow never uses pull_request_target and never prints a secret.
+name: ci
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: cli
+        working-directory: cli
+        run: npm ci --ignore-scripts --no-audit --no-fund && npm test
+      - name: mcp
+        working-directory: mcp
+        run: npm ci --ignore-scripts --no-audit --no-fund && npm test
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: prepublish checks (files, metadata, public text)
+        run: |
+          (cd cli && npm ci --ignore-scripts --no-audit --no-fund && node scripts/prepublish-check.mjs)
+          (cd mcp && npm ci --ignore-scripts --no-audit --no-fund && node scripts/prepublish-check.mjs)
+      - name: safety scan
+        env:
+          # Private word and host lists; empty for forks, where only the built-in rules run. Findings for these
+          # rules are reported without the matched value.
+          SCAN_FORBIDDEN_WORDS: ${{ secrets.SCAN_FORBIDDEN_WORDS }}
+          SCAN_DENY_HOSTS: ${{ secrets.SCAN_DENY_HOSTS }}
+          SCAN_INTERNAL_NAMES: ${{ secrets.SCAN_INTERNAL_NAMES }}
+          SCAN_WORDING: ${{ secrets.SCAN_WORDING }}
+        run: node .github/scripts/safety-scan.mjs --allow-file scan-allow.txt README.md cli mcp examples

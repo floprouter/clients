@@ -1,0 +1,47 @@
+# Release on a version tag (vX.Y.Z): run the checks, then publish both packages to npm with provenance.
+# Publishing uses npm trusted publishing (OIDC, no stored token) once it is configured on npmjs.com for this repository,
+# this workflow file and the `npm` environment; until then the NPM_TOKEN secret of the `npm` environment is used.
+# The environment only accepts tags matching v*, so a branch or a pull request can never reach the publish step.
+name: release
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+  publish:
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: tag matches the CLI version
+        run: |
+          v="$(node -p 'require("./cli/package.json").version')"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match cli/package.json $v"; exit 1; }
+      - name: publish (skips versions already on the registry)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for d in cli mcp; do
+            name="$(node -p "require('./$d/package.json').name")"; v="$(node -p "require('./$d/package.json').version")"
+            if npm view "$name@$v" version >/dev/null 2>&1; then echo "$name@$v is already published"; continue; fi
+            (cd "$d" && npm ci --ignore-scripts --no-audit --no-fund && npm publish --provenance --access public)
+            for i in $(seq 1 30); do [ "$(npm view "$name" dist-tags.latest)" = "$v" ] && break; sleep 10; done
+            [ "$(npm view "$name" dist-tags.latest)" = "$v" ] || { echo "$name latest did not move to $v"; exit 1; }
+            echo "$name@$v published"
+          done
