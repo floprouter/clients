@@ -102,7 +102,14 @@ export async function health(ctx, o) {
   if (o.json) return printJson(h);
   console.log(`${bold(ctx.api.base)}  ${h.status === 'ok' ? green('ok') : yellow(h.status)}  ${h.network}  block ${h.finalized_block}`);
   console.log(`miners ${h.registry?.miners}, models ${h.registry?.models}, endpoints verified ${h.endpoints?.verified} (ready ${h.endpoints?.verified_ready})`);
-  if (h.payer) console.log(`payer ${h.payer.kind} ${h.payer.address}`);
+  // payer: {kind, address} in the earlier format, {router_wallet, modes, ...} in the current one.
+  if (h.payer) {
+    const wallet = h.payer.router_wallet ?? h.payer.address;
+    const modes = Array.isArray(h.payer.modes) ? h.payer.modes.join(', ') : h.payer.kind;
+    console.log(`payer modes ${modes ?? '-'}${wallet ? `, router wallet ${wallet}` : ''}${h.payer.demo ? ', demo on' : ''}`);
+  } else console.log('payer none: this router serves the directory only');
+  const f = h.finality;
+  if (f && typeof f.lag_blocks === 'number') console.log(`finality ${f.finalized_block} of ${f.best_block} (${f.lag_blocks} blocks behind${f.waiting ? ', waiting' : ''})`);
 }
 
 // ---- chat --------------------------------------------------------------------------------------------------------
@@ -129,6 +136,12 @@ function chatBody(o, model, messages, stream) {
   };
 }
 
+function tokensOf(u) {
+  if (!u) return null;
+  const t = u.total_tokens ?? (typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number' ? u.prompt_tokens + u.completion_tokens : null);
+  return t === null ? null : `${t} tokens`;
+}
+
 /** One status line on stderr: session, model (when a fallback answered), miner, cost, payer, tokens; ignored parameters. */
 function footer({ flop, usage, model, requested, headers }) {
   const ignored = (headers?.get?.('x-floprouter-ignored-parameters') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
@@ -137,10 +150,10 @@ function footer({ flop, usage, model, requested, headers }) {
   if (!flop) return;
   const cost = costOf({ usage });
   const parts = [`session ${flop.session_id ?? headers?.get?.('x-generation-id') ?? '-'}`,
-    model && requested && model !== requested && `model ${model} (fallback)`,
+    model && requested && String(model).toLowerCase() !== String(requested).toLowerCase() && `model ${model} (fallback)`,
     `miner ${short(flop.miner)}`, cost !== null ? `cost ${cost} FLOP${usage?.cost_details?.final === false ? ' (until settled)' : ''}` : flop.escrow && `escrow ${flop.escrow} FLOP`,
     flop.payer?.mode ? `payer ${flop.payer.mode}${flop.payer.fallback_from ? ` (from ${flop.payer.fallback_from})` : ''}` : flop.payer?.kind && `payer ${flop.payer.kind}`,
-    `status ${flop.status}`, usage && `${usage.total_tokens} tokens`].filter(Boolean);
+    `status ${flop.status}`, tokensOf(usage)].filter(Boolean);
   err(dim(`[${parts.join(' · ')}]`));
 }
 
@@ -235,7 +248,7 @@ export async function chat(ctx, o, words) {
       process.stdout.write(bold('assistant> '));
       const reply = await oneTurn(ctx, { ...o, json: false }, model, history);
       history.push({ role: 'assistant', content: reply });
-    } catch (e) { history.pop(); err(red(describe(e))); }
+    } catch (e) { history.pop(); process.stdout.write('\n'); err(red(describe(e))); err(dim('(not added to the conversation; send it again, or /model to try another model)')); }
   }
   rl.close();
 }
@@ -323,13 +336,19 @@ export async function balance(ctx, o) {
   }
 }
 
-function activeGrant(g) {
-  const list = Array.isArray(g?.data) ? g.data : Array.isArray(g) ? g : g ? [g] : [];
-  return list.find((x) => x.active) ?? list[0] ?? null;
+function activeGrant(g, delegate) {
+  let list = Array.isArray(g?.data) ? g.data : Array.isArray(g) ? g : g ? [g] : [];
+  if (delegate) list = list.filter((x) => !x.delegate || x.delegate === delegate);
+  return list.find((x) => x.state === 'waiting_for_finality') ?? list.find((x) => x.active) ?? list[0] ?? null;
 }
 
 function describeGrant(g) {
   const x = activeGrant(g);
+  if (x?.state === 'waiting_for_finality') {
+    const pnd = x.pending ?? {};
+    return yellow(`waiting for finality: in block ${pnd.best_block ?? '?'}, final up to ${pnd.finalized_block ?? '?'}; reads as ${pnd.at_best ?? 'the new state'} once final`);
+  }
+  if (x?.state === 'revoked') return 'revoked (run `floprouter grant` to grant again)';
   if (!x || x.state === 'assigned' || (!x.active && x.state !== 'expired')) return 'none (run `floprouter grant`)';
   if (x.state === 'expired' || !x.active) return yellow(`${x.state}: sign a new one with \`floprouter grant\``);
   return [green(x.state ?? 'active'), x.remaining && `${x.remaining} of ${x.spending_cap} FLOP left`,
@@ -375,6 +394,7 @@ export function readGrantParams(p) {
     spendingCap: pick(a.spending_cap), perTxLimit: pick(a.per_tx_limit), dailyCap: pick(a.daily_cap),
     durationBlocks: pick(a.duration_blocks, args?.[4]), feeFloat: pick(a.fee_float, p.fee_float),
     maxDurationBlocks: pick(l.max_session_duration_blocks, l.max_duration_blocks),
+    renewal: p.renewal === true, renewalCall: p.renewal_call ?? null,
   };
 }
 
@@ -405,7 +425,7 @@ export async function grant(ctx, o) {
       if (!(await confirm('Sign and submit?', o))) return err('cancelled');
       const r = await signAndWait(api, api.tx.flopSessionKeys.revokeSession(p.delegate), pair, (s) => err(dim(`  ${s}`)));
       err(green(`revoked in block ${r.block} (tx ${r.tx})`));
-      await syncGrant(ctx);
+      await syncGrant(ctx, { delegate: p.delegate, expect: 'gone' });
       return;
     }
 
@@ -431,7 +451,13 @@ export async function grant(ctx, o) {
     const existing = await api.query.flopSessionKeys.sessions(pair.address, p.delegate);
     const active = existing.isSome && existing.unwrap().active?.isTrue === true;
     const create = api.tx.flopSessionKeys.createSession(p.delegate, raw.cap, raw.tx, raw.day, want.durationBlocks, ALLOWED_PALLETS);
-    const tx = raw.float > 0n ? api.tx.utility.batchAll([create, api.tx.balances.transferKeepAlive(p.delegate, raw.float)]) : create;
+    // The chain refuses a second createSession while a grant to the same delegate is active
+    // (SessionAlreadyExists), so a renewal is revokeSession + createSession in one batchAll: one signature, and
+    // if either part fails nothing changes. Built here, from the chain's own state, not from server call data.
+    if (active && p.renewalCall) checkRenewalCall(p.renewalCall, p.delegate);
+    const calls = [...(active ? [api.tx.flopSessionKeys.revokeSession(p.delegate)] : []), create,
+      ...(raw.float > 0n ? [api.tx.balances.transferKeepAlive(p.delegate, raw.float)] : [])];
+    const tx = calls.length === 1 ? calls[0] : api.tx.utility.batchAll(calls);
 
     const hours = want.durationBlocks / blocksPerHour;
     const span = hours < 48 ? `${hours.toFixed(1)} hours` : `${(hours / 24).toFixed(1)} days`;
@@ -445,14 +471,15 @@ export async function grant(ctx, o) {
     console.log(`  per day               ${want.dailyCap} FLOP at most`);
     console.log(`  duration              ${want.durationBlocks} blocks (about ${span})`);
     if (raw.float > 0n) console.log(`  fee float             ${want.feeFloat} FLOP sent to the delegate for its transaction fees`);
-    if (active) console.log(`  replaces              your active grant to the same delegate`);
+    if (active) console.log(`  renews                your active grant: revoke and new grant in one transaction (one signature)`);
     console.log(dim('  Within these caps the router opens compute channels that your wallet pays for. Revoke any time:'));
     console.log(dim('  floprouter grant --revoke\n'));
     if (!(await confirm('Sign and submit?', o))) return err('cancelled');
     const r = await signAndWait(api, tx, pair, (s) => err(dim(`  ${s}`)));
     pair.lock?.();
     err(green(`grant finalized in block ${r.block} (tx ${r.tx})`));
-    await syncGrant(ctx);
+    // A renewal replaces an active grant, so "active" alone could still be the old one: wait for the new cap.
+    await syncGrant(ctx, { delegate: p.delegate, expect: 'active', cap: want.spendingCap });
   } finally { await api.disconnect(); }
 }
 
@@ -463,12 +490,37 @@ async function grantStatus(ctx, o) {
   console.log(describeGrant(g));
 }
 
-async function syncGrant(ctx) {
+/**
+ * Re-syncs until the router reads the new state. The router reads grants at its finalized block, which can trail the
+ * block our transaction was final in (and devnet finality sometimes lags by minutes), so one immediate sync can still
+ * show the old state.
+ */
+async function syncGrant(ctx, { delegate, expect, cap, maxMs = 180_000, everyMs = 5_000 } = {}) {
   if (!ctx.api.hasKey) return err(dim('No API key yet: run `floprouter login`, then `floprouter balance` shows the grant.'));
-  try {
-    const g = await ctx.api.post('/v1/grants/sync', {});
-    err(`router sees: ${describeGrant(g)}`);
-  } catch (e) { err(yellow(`the router could not read the grant yet: ${describe(e)}`)); }
+  const t0 = Date.now(); let said = false; let g = null;
+  for (;;) {
+    try { g = await ctx.api.post('/v1/grants/sync', {}); } catch (e) { err(yellow(`the router could not read the grant yet: ${describe(e)}`)); return; }
+    const x = activeGrant(g, delegate);
+    const state = x?.state ?? 'none';
+    const done = expect === 'active' ? state === 'active' && x.active !== false && (cap === undefined || Number(x.spending_cap) === Number(cap))
+      : state !== 'waiting_for_finality' && !(x?.active === true && state === 'active');
+    if (done) return err(`router sees: ${describeGrant(g)}`);
+    if (Date.now() - t0 > maxMs) {
+      return err(yellow(`router still sees: ${describeGrant(g)}. It reads grants at its finalized block, which is behind; check again with \`floprouter grant --status\`.`));
+    }
+    if (!said) { err(dim('waiting for the router to read it at its finalized block...')); said = true; }
+    await new Promise((r) => setTimeout(r, everyMs));
+  }
+}
+
+/** The server's renewal description, if any, must be exactly revokeSession(delegate) + createSession(delegate, ...). */
+function checkRenewalCall(rc, delegate) {
+  const calls = rc?.calls ?? [];
+  const ok = rc?.pallet === 'utility' && rc?.method === 'batchAll' && calls.length === 2
+    && calls[0]?.pallet === 'flopSessionKeys' && calls[0]?.method === 'revokeSession' && calls[0]?.args?.[0] === delegate
+    && calls[1]?.pallet === 'flopSessionKeys' && calls[1]?.method === 'createSession' && calls[1]?.args?.[0] === delegate
+    && JSON.stringify(calls[1]?.args?.[5]) === JSON.stringify(ALLOWED_PALLETS);
+  if (!ok) throw new Error('the router describes a renewal other than revokeSession + createSession for its delegate; refusing to sign');
 }
 
 export async function deposit(ctx, o, args) {
@@ -559,8 +611,22 @@ export async function withdraw(ctx, o, args) {
     }
     throw e;
   }
+  // Current API: 202 with status "submitted" and a poll URL (finality can take minutes); earlier: the final transfer.
+  if (w.poll && !['sent', 'failed'].includes(w.status)) {
+    err(dim(`submitted (tx ${w.tx ?? '-'}); waiting for it to be final...`));
+    const t0 = Date.now();
+    while (!['sent', 'failed'].includes(w.status) && Date.now() - t0 < 300_000) {
+      await new Promise((r) => setTimeout(r, 5_000));
+      try { w = { ...w, ...(await ctx.api.get(w.poll.replace(/^\/api\/v1\//, '/v1/'))) }; } catch { /* keep polling */ }
+    }
+  }
   if (o.json) return printJson(w);
-  err(green(`${w.status ?? 'sent'}: ${w.sent ?? w.requested} FLOP to ${w.to}${w.chain_fee ? ` (chain fee ${w.chain_fee})` : ''}${w.tx ? `, tx ${w.tx}` : ''}`));
+  if (w.status === 'failed') throw new Error(`the withdrawal failed and nothing was sent: ${w.error ?? 'unknown reason'}`);
+  if (w.status !== 'sent') {
+    err(yellow(`${w.status}: ${w.requested} FLOP, tx ${w.tx ?? '-'}. Not final yet; the amount stays held until it is. Check with \`floprouter balance\`.`));
+    return;
+  }
+  err(green(`sent ${w.sent} FLOP to ${w.to}${w.chain_fee ? ` (chain fee ${w.chain_fee})` : ''}${w.tx ? `, tx ${w.tx}` : ''}`));
   if (w.balance_after !== undefined) err(`balance now ${w.balance_after} FLOP`);
 }
 

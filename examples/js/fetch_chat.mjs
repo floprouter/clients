@@ -26,8 +26,14 @@ const ignored = res.headers.get('x-floprouter-ignored-parameters');
 if (ignored) console.log('ignored by the model:', ignored);
 
 if (!stream) {
-  const data = await res.json();
-  if (data.object === 'chat.completion.pending') throw new Error(`pending: poll ${data.poll}`);
+  const data = await res.json();   // leading spaces (the server's keep-alive while it waits) are fine for JSON
+  // An error after a long wait arrives as a 200 body; error.code is the real status.
+  if (data.error) { console.error(`HTTP ${data.error.code} ${data.error.metadata?.reason}: ${data.error.message}`); process.exit(1); }
+  if (data.object === 'chat.completion.pending') {   // earlier API version: no verified reply within ~85 s
+    console.log(`pending ${data.id}; polling`);
+    console.log(await waitForReply(data.id));
+    process.exit(0);
+  }
   console.log(data.choices[0].message.content);
   console.log(`cost=${data.usage?.cost} FLOP session=${data.flop?.session_id} miner=${data.flop?.miner} status=${data.flop?.status}`);
 } else {
@@ -50,4 +56,26 @@ if (!stream) {
     }
   }
   console.log(`\ncost=${usage?.cost} FLOP session=${flop?.session_id} miner=${flop?.miner} status=${flop?.status}`);
+}
+
+/** Polls a generation that is still running (a 202 "pending" answer) until it has the verified reply.
+ *  GET /v1/generation?id= on the current API; GET /v1/sessions/{id} on an earlier one. */
+async function waitForReply(id, { everyMs = 5000, limitMs = 300_000 } = {}) {
+  const base = (process.env.FLOPROUTER_BASE_URL ?? 'https://api.floprouter.com') + '/v1';
+  const headers = { authorization: `Bearer ${process.env.FLOPROUTER_API_KEY ?? ''}` };
+  for (const t0 = Date.now(); Date.now() - t0 < limitMs;) {
+    await new Promise((r) => setTimeout(r, everyMs));
+    for (const path of [`/generation?id=${id}`, `/sessions/${id}`]) {
+      const r = await fetch(base + path, { headers });
+      if (r.status === 404) continue;                       // this router has no /generation: try the session record
+      const body = await r.json(); const rec = body.data ?? body;   // /generation wraps in data, /sessions does not
+      const raw = rec.reply ?? null;
+      const text = typeof raw === 'string' ? raw : raw?.content;
+      if (typeof text === 'string') return text;
+      const status = rec.flop?.status ?? rec.status;
+      if (['failed', 'refunded', 'voided', 'fraud'].includes(status)) throw new Error(`generation ${id} ended ${status} without a reply`);
+      break;
+    }
+  }
+  throw new Error(`no reply yet for ${id}; look it up later with GET /v1/generation?id=${id}`);
 }

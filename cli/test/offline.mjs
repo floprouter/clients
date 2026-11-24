@@ -39,7 +39,7 @@ assert.equal(p.callMethod, 'createSession');
 assert.deepEqual(p.allowedPallets, ['ComputeChannel']);
 assert.equal(p.spendingCap, '5'); assert.equal(p.argRaw.cap, '5000000000000000000'); assert.equal(p.durationBlocks, 864000);
 // 5. help runs
-assert.match(execFileSync(process.execPath, [bin, 'help'], { encoding: 'utf8' }), /floprouter 0\.1\.0/);
+assert.match(execFileSync(process.execPath, [bin, 'help'], { encoding: 'utf8' }), /floprouter 0\.1\.1/);
 
 // 6. the CLI against a fake router in the earlier and the current API formats
 const http = await import('node:http');
@@ -57,6 +57,10 @@ const fake = (format) => http.createServer((req, res) => {
     let body = ''; req.on('data', (c) => { body += c; }); req.on('end', () => {
       const b = JSON.parse(body);
       if (b.model === 'grant/expired') return error(402, 'grant_expired', 'the grant expired');
+      if (b.model === 'late/error') {   // current API: headers already sent, spaces, then an error as a 200 body
+        res.writeHead(200, { 'content-type': 'application/json' }); res.write('   ');
+        return res.end(JSON.stringify({ error: { code: 503, message: 'no provider completed the request', metadata: { reason: 'all_attempts_failed' } } }));
+      }
       if (b.model === 'slow/model') return send(202, { id: 'gen-p11111', object: 'chat.completion.pending', poll: '/v1/sessions/gen-p11111' });
       if (b.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream', ...(format === 'new' ? { 'x-generation-id': 'gen-s1' } : {}) });
@@ -73,6 +77,16 @@ const fake = (format) => http.createServer((req, res) => {
     });
     return;
   }
+  if (url.pathname === '/health') return send(200, { status: 'ok', network: 'devnet', finalized_block: 10, registry: { miners: 1, models: 1 }, endpoints: { verified: 1, verified_ready: 1 },
+    payer: format === 'new' ? { router_wallet: '5Router', modes: ['grant', 'credit'], demo: false } : { kind: 'router-wallet', address: '5Router' },
+    ...(format === 'new' ? { finality: { best_block: 14, finalized_block: 10, lag_blocks: 4, waiting: false } } : {}) });
+  if (url.pathname === '/v1/balance') return send(200, { address: '5Me', balance: '1', available: '1', held: '0', deposit_address: '5Dep', fee_percent: 5, recent: [],
+    withdrawals: format === 'new' ? { enabled: true, min: '0.01', recent: [{ status: 'sent', sent: '0.04', tx: '0xabc', created_at: 'now' }] } : undefined });
+  if (url.pathname === '/v1/grants') return send(200, { object: 'list', data: [] });
+  if (url.pathname === '/v1/balance/withdraw') return format === 'new'
+    ? send(202, { object: 'withdrawal', id: 'wd-0000000000000001', status: 'submitted', requested: '0.05', tx: '0xabc', poll: '/v1/balance/withdrawals/wd-0000000000000001' })
+    : error(404, 'not_found', 'no route');
+  if (url.pathname === '/v1/balance/withdrawals/wd-0000000000000001') return send(200, { object: 'withdrawal', id: 'wd-0000000000000001', status: 'sent', requested: '0.05', sent: '0.047', chain_fee: '0.003', to: '5Me', tx: '0xabc' });
   if (url.pathname === '/v1/key') return format === 'new' ? send(200, { data: { usage: 0.5, usage_daily: 0.1, limit: null, flop: { key_id: 'key_1', address: '5Me', payer_mode: 'grant' } } }) : error(404, 'not_found', 'no route');
   if (url.pathname === '/v1/generation') return format === 'new' ? send(200, { data: { id: 'gen-1', total_cost: 0.0105, tokens_prompt: 3, tokens_completion: 1, flop: { status: 'settled' } } }) : error(404, 'not_found', 'no route');
   if (url.pathname === '/v1/sessions/gen-111111') return send(200, { session_id: 'gen-111111', status: 'settled' });
@@ -106,6 +120,16 @@ for (const format of ['old', 'new']) {
   assert.equal(r.code, 0, r.err); assert.match(r.out, format === 'new' ? /0\.0105 FLOP/ : /settled/);
   r = await run(base, ['chat', '--model', 'slow/model', 'hi']);
   assert.equal(r.code, 0, r.err); assert.match(r.out, /late reply/); assert.match(r.err, /polling/);
+  r = await run(base, ['status']);
+  assert.equal(r.code, 0, r.err); assert.doesNotMatch(r.out, /undefined/); assert.match(r.out, /5Router/);
+  if (format === 'new') assert.match(r.out, /4 blocks behind/);
+  r = await run(base, ['balance']);
+  assert.equal(r.code, 0, r.err); assert.match(r.out, /balance\s+1 FLOP/);
+  if (format === 'new') assert.match(r.out, /withdrawal\s+sent 0\.04/);
+  r = await run(base, ['chat', '--model', 'late/error', 'hi']);
+  assert.equal(r.code, 1); assert.match(r.err, /all_attempts_failed: no provider completed/);
+  r = await run(base, ['withdraw', '0.05', '--yes']);
+  if (format === 'new') { assert.equal(r.code, 0, r.err); assert.match(r.err, /sent 0\.047 FLOP to 5Me/); } else { assert.equal(r.code, 1); assert.match(r.err, /does not offer withdrawals/); }
   r = await run(base, ['miner', 'nope']);
   assert.equal(r.code, 1); assert.match(r.err, /not a miner address/);
   srv.close();

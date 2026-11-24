@@ -22,7 +22,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { ApiError, DEFAULT_BASE_URL, costOf, isMissingRoute, makeClient, modelFacts } from './api.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const env = process.env;
 // Fallback: the file written by `floprouter login` (the CLI), so one login serves both.
 function cliConfig() {
@@ -35,6 +35,9 @@ const API_KEY = env.FLOPROUTER_API_KEY || saved.api_key;
 const SETTLE_WAIT_MS = Number(env.FLOPROUTER_SETTLE_WAIT_MS || 300_000);
 // MCP clients commonly time a tool call out at 60 s; chat answers within this budget, with an id if still running.
 const TOOL_BUDGET_MS = Number(env.FLOPROUTER_TOOL_BUDGET_MS || 50_000);
+// A client that asks for progress (a progressToken) gets a notification every 10 s and a longer budget: clients that
+// reset their timeout on progress can then wait for a slow reply instead of getting `pending`.
+const PROGRESS_BUDGET_MS = Number(env.FLOPROUTER_PROGRESS_BUDGET_MS || 240_000);
 const FINAL = new Set(['settled', 'refunded', 'failed', 'fraud', 'voided']);
 const TIMEOUT_MS = Number(env.FLOPROUTER_TIMEOUT_MS || 300_000);
 
@@ -48,7 +51,7 @@ const fail = (e) => {
     : `error: ${e?.message ?? e}`;
   return { isError: true, content: [{ type: 'text', text: msg }] };
 };
-const tool = (fn) => async (args) => { try { return await fn(args ?? {}); } catch (e) { return fail(e); } };
+const tool = (fn) => async (args, extra) => { try { return await fn(args ?? {}, extra); } catch (e) { return fail(e); } };
 
 /** Calls an endpoint that a router may not have yet; a 404 for the route itself becomes a plain note. */
 async function optional(call) {
@@ -160,7 +163,7 @@ export function buildServer({ apiKey } = {}) {
       wait_for_settlement: z.boolean().optional().describe('After the reply, poll until the on-chain settlement is final (2-5 minutes; only for clients without a tool timeout). Default false: return as soon as the reply is verified and check later with session_status'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, tool(async (a) => {
+  }, tool(async (a, extra) => {
     const messages = a.messages?.length ? a.messages
       : a.prompt ? [...(a.system ? [{ role: 'system', content: a.system }] : []), { role: 'user', content: a.prompt }] : null;
     if (!messages) throw new Error('give `prompt` or `messages`');
@@ -175,8 +178,16 @@ export function buildServer({ apiKey } = {}) {
     // Streamed internally: the generation id arrives with the response headers (or the first chunk), so when the
     // reply takes longer than the tool budget (MCP clients commonly give up after 60 s) the agent still gets an id to
     // check later. Closing the stream does not cancel the session: it completes and settles on the router.
+    const progressToken = extra?._meta?.progressToken;
+    const budget = progressToken !== undefined ? PROGRESS_BUDGET_MS : TOOL_BUDGET_MS;
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(new Error('tool budget')), TOOL_BUDGET_MS);
+    const timer = setTimeout(() => ctl.abort(new Error('tool budget')), budget);
+    const t0 = Date.now();
+    const beat = progressToken === undefined ? null : setInterval(() => {
+      const secs = Math.round((Date.now() - t0) / 1000);
+      void extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: secs, total: Math.round(budget / 1000),
+        message: id ? `waiting for the miner's verified reply (${id}, ${secs} s)` : `waiting for a miner (${secs} s)` } }).catch(() => undefined);
+    }, 10_000);
     let id = null; let headers = null; let content = ''; let finish = null; let usage = null; let flop = null; let model = null;
     try {
       await api.stream('/v1/chat/completions', { ...body, stream: true }, {
@@ -193,10 +204,10 @@ export function buildServer({ apiKey } = {}) {
       if (!ctl.signal.aborted) throw e;
       return ok({
         pending: true, generation_id: id,
-        message: id ? `no verified reply within ${Math.round(TOOL_BUDGET_MS / 1000)} s; the request continues on the router. Call generation (or session_status) with this id in a minute.`
-          : `no reply within ${Math.round(TOOL_BUDGET_MS / 1000)} s and no id yet; the request may still complete. Check your recent sessions later.`,
+        message: id ? `no verified reply within ${Math.round(budget / 1000)} s; the request continues on the router. Call generation (or session_status) with this id in a minute.`
+          : `no reply within ${Math.round(budget / 1000)} s and no id yet; the request may still complete. Check your recent sessions later.`,
       });
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); if (beat) clearInterval(beat); }
     if (a.wait_for_settlement && flop?.session_id) {
       const t0 = Date.now();
       for (;;) {
@@ -260,7 +271,17 @@ export function buildServer({ apiKey } = {}) {
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, tool(async ({ amount }) => {
     if (!api.hasKey) return ok({ unavailable: 'no API key configured' });
-    try { return ok(await api.post('/v1/balance/withdraw', { amount })); } catch (e) {
+    try {
+      let w = await api.post('/v1/balance/withdraw', { amount });
+      // Current API: 202 "submitted" with a poll URL; poll briefly (within the tool budget), then return the state.
+      const t0 = Date.now();
+      while (w?.poll && !['sent', 'failed'].includes(w.status) && Date.now() - t0 < TOOL_BUDGET_MS - 10_000) {
+        await new Promise((res) => setTimeout(res, 5_000));
+        try { w = { ...w, ...(await api.get(w.poll.replace(/^\/api\/v1\//, '/v1/'))) }; } catch { break; }
+      }
+      if (w?.poll && !['sent', 'failed'].includes(w.status)) w.note = 'not final yet; the amount stays held until it is. The account tool shows it under withdrawals.';
+      return ok(w);
+    } catch (e) {
       if (isMissingRoute(e)) return ok({ unavailable: 'this router does not offer withdrawals yet' });
       throw e;
     }

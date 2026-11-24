@@ -15,6 +15,38 @@ KEY = os.environ.get("FLOPROUTER_API_KEY", "")
 MODEL = os.environ.get("FLOPROUTER_MODEL", "qwen/qwen3-8b")
 STREAM = "--stream" in sys.argv
 
+
+def wait_for_reply(gen_id, every=5, limit=300):
+    """Polls a generation that is still running (a 202 "pending" answer) until it has the verified reply.
+
+    GET /v1/generation?id= on the current API; GET /v1/sessions/{id} on an earlier one."""
+    import json, time, urllib.error, urllib.request
+    headers = {"Authorization": f"Bearer {os.environ.get('FLOPROUTER_API_KEY', '')}"}
+    base = os.environ.get("FLOPROUTER_BASE_URL", "https://api.floprouter.com") + "/v1"
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        time.sleep(every)
+        for path in (f"/generation?id={gen_id}", f"/sessions/{gen_id}"):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=30) as r:
+                    rec = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue  # this router has no /generation: try the session record
+                raise
+            rec = rec.get("data", rec)
+            reply = rec.get("reply")
+            text = reply if isinstance(reply, str) else (reply or {}).get("content")
+            if isinstance(text, str):
+                return text
+            status = (rec.get("flop") or {}).get("status") or rec.get("status")
+            if status in ("failed", "refunded", "voided", "fraud"):
+                raise SystemExit(f"generation {gen_id} ended {status} without a reply")
+            break
+    raise SystemExit(f"no reply yet for {gen_id}; look it up later with GET /v1/generation?id={gen_id}")
+
+
+
 body = {
     "model": MODEL,
     # "models": ["qwen/qwen2.5-0.5b-instruct"],   # optional fallback list, tried when no miner serves MODEL
@@ -40,9 +72,14 @@ if resp.headers.get("X-Floprouter-Ignored-Parameters"):
     print("ignored by the model:", resp.headers["X-Floprouter-Ignored-Parameters"])
 
 if not STREAM:
-    data = json.loads(resp.read())
-    if data.get("object") == "chat.completion.pending":   # no verified reply within ~85 s; the session continues
-        sys.exit(f"pending: poll {data.get('poll')}")
+    data = json.loads(resp.read())   # leading spaces (the server's keep-alive while it waits) are fine for JSON
+    if "error" in data:              # an error after a long wait arrives as a 200 body; error.code is the real status
+        err = data["error"]
+        sys.exit(f"HTTP {err.get('code')} {(err.get('metadata') or {}).get('reason')}: {err.get('message')}")
+    if data.get("object") == "chat.completion.pending":   # earlier API version: no verified reply within ~85 s
+        print(f"pending {data['id']}; polling")
+        print(wait_for_reply(data["id"]))
+        sys.exit(0)
     print(data["choices"][0]["message"]["content"])
     usage, flop = data.get("usage", {}), data.get("flop", {})
     print(f"cost={usage.get('cost')} FLOP session={flop.get('session_id')} miner={flop.get('miner')} status={flop.get('status')}")

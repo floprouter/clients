@@ -5,7 +5,7 @@ import { makeClient, DEFAULT_BASE_URL } from '../src/api.js';
 import { configPath, dim, err, readConfig, red, writeConfig } from '../src/io.js';
 import * as cmd from '../src/commands.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 
 const HELP = `floprouter ${VERSION}: the floprouter API from the command line (chat with FLOP Network miners, paid in FLOP)
 

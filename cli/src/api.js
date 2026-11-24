@@ -71,7 +71,13 @@ export function makeClient({ baseUrl, apiKey, timeoutMs = 600_000, userAgent = '
     const { res, done } = await raw(method, path, opts);
     try {
       const text = await res.text();
-      const data = text ? JSON.parse(text) : null;
+      const data = text.trim() ? JSON.parse(text) : null;   // leading whitespace: the server's keep-alive bytes
+      // After a long wait the current API has already sent 200, so a late error arrives as a 200 JSON error body
+      // with the real status in error.code. (Session records carry `error` as a string or null, never an object.)
+      if (data && typeof data.error === 'object' && data.error !== null && typeof data.error.message === 'string') {
+        const er = readError(data.error, res.status);
+        throw new ApiError(typeof data.error.code === 'number' ? data.error.code : res.status, er.reason, er.message, data, er.metadata);
+      }
       if (data && typeof data === 'object') {
         Object.defineProperty(data, HEADERS, { value: res.headers, enumerable: false });
         Object.defineProperty(data, 'httpStatus', { value: res.status, enumerable: false });

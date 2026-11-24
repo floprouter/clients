@@ -39,18 +39,43 @@ def call(method, path, body=None):
 
 def complete(messages):
     status, data = call("POST", "/chat/completions", {"model": MODEL, "messages": messages, "max_tokens": 96})
-    if data.get("object") == "chat.completion.pending":          # no verified reply within ~85 s: poll the session
-        for _ in range(36):
-            time.sleep(5)
-            _, s = call("GET", f"/sessions/{data['id']}")
-            reply = s.get("reply")
-            text = reply if isinstance(reply, str) else (reply or {}).get("content")   # string or {role, content}
-            if isinstance(text, str):
-                return text, data["id"], None
-            if s.get("status") in ("failed", "refunded", "voided", "fraud"):
-                raise SystemExit(f"session {data['id']} ended {s['status']}")
-        raise SystemExit(f"no reply yet for {data['id']}")
+    if "error" in data:   # an error after a long wait arrives as a 200 body; error.code is the real status
+        err = data["error"]
+        raise SystemExit(f"HTTP {err.get('code')} {(err.get('metadata') or {}).get('reason')}: {err.get('message')}")
+    if data.get("object") == "chat.completion.pending":   # earlier API version: no verified reply within ~85 s
+        return wait_for_reply(data["id"]), data["id"], None
     return data["choices"][0]["message"]["content"] or "", data.get("id"), (data.get("usage") or {}).get("cost")
+
+
+def wait_for_reply(gen_id, every=5, limit=300):
+    """Polls a generation that is still running (a 202 "pending" answer) until it has the verified reply.
+
+    GET /v1/generation?id= on the current API; GET /v1/sessions/{id} on an earlier one."""
+    import json, time, urllib.error, urllib.request
+    headers = {"Authorization": f"Bearer {os.environ.get('FLOPROUTER_API_KEY', '')}"}
+    base = os.environ.get("FLOPROUTER_BASE_URL", "https://api.floprouter.com") + "/v1"
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        time.sleep(every)
+        for path in (f"/generation?id={gen_id}", f"/sessions/{gen_id}"):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=30) as r:
+                    rec = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue  # this router has no /generation: try the session record
+                raise
+            rec = rec.get("data", rec)
+            reply = rec.get("reply")
+            text = reply if isinstance(reply, str) else (reply or {}).get("content")
+            if isinstance(text, str):
+                return text
+            status = (rec.get("flop") or {}).get("status") or rec.get("status")
+            if status in ("failed", "refunded", "voided", "fraud"):
+                raise SystemExit(f"generation {gen_id} ended {status} without a reply")
+            break
+    raise SystemExit(f"no reply yet for {gen_id}; look it up later with GET /v1/generation?id={gen_id}")
+
 
 
 def calc(expr):

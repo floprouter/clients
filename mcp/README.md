@@ -16,6 +16,7 @@ npx -y floprouter-mcp --http          # streamable HTTP on http://127.0.0.1:8792
 | `FLOPROUTER_API_KEY` | API key (`fr_...`). If it is not set, the key saved by `floprouter login` is used. Without a key, only the read-only tools work. |
 | `FLOPROUTER_BASE_URL` | Default `https://api.floprouter.com` |
 | `FLOPROUTER_TOOL_BUDGET_MS` | How long `chat` waits for the reply before it returns the generation id to check later. Default 50000, under the 60 s at which MCP clients commonly time a tool out |
+| `FLOPROUTER_PROGRESS_BUDGET_MS` | When the client asks for progress (sends a progress token), `chat` reports progress every 10 s and waits up to this long instead. Default 240000; clients that reset their timeout on progress then get the reply directly |
 | `FLOPROUTER_TIMEOUT_MS` | Per-request timeout for the other tools, default 300000 |
 | `FLOPROUTER_SETTLE_WAIT_MS` | How long `chat` polls when `wait_for_settlement` is true, default 300000 |
 
@@ -35,7 +36,7 @@ In HTTP mode, each request may carry its own key in `Authorization: Bearer fr_..
 | `withdraw` | Sends prepaid balance back to the wallet that owns the key | to the owner only |
 | `router_status` | Network, sync state and payer | no |
 
-`chat` returns once the miner's reply is verified, typically in 10 to 40 s. If that takes longer than the tool budget, it returns `pending: true` with the `generation_id`. The request carries on and can be read with `generation` a minute later. The on-chain settlement follows 2 to 5 minutes after the reply; check it with `session_status`.
+`chat` returns once the miner's reply is verified, typically in 10 to 40 s (on devnet, often 1 to 2 minutes when a channel has to be opened without an offer). If that takes longer than the tool budget, it returns `pending: true` with the `generation_id`. The request carries on and can be read with `generation` a minute later. The on-chain settlement follows 2 to 5 minutes after the reply; check it with `session_status`.
 
 ## Client configuration
 

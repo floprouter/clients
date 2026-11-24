@@ -21,9 +21,12 @@ if (useHttp) {
 }
 const tools = await client.listTools();
 console.log('tools:', tools.tools.map((t) => t.name).join(', '));
+// --progress: ask for progress notifications and reset the client timeout on each (as clients that support it do).
+const withProgress = process.argv.includes('--progress');
 const call = async (name, args = {}) => {
   const t0 = Date.now();
-  const r = await client.callTool({ name, arguments: args });
+  const opts = withProgress ? { onprogress: (p) => console.log(`   progress ${p.progress}/${p.total ?? '?'} ${p.message ?? ''}`), resetTimeoutOnProgress: true, timeout: 60_000, maxTotalTimeout: 300_000 } : undefined;
+  const r = await client.callTool({ name, arguments: args }, undefined, opts);
   const out = text(r);
   console.log(`\n== ${name} ${JSON.stringify(args)} -> ${r.isError ? 'ERROR' : 'ok'} in ${Date.now() - t0} ms\n${out.slice(0, 700)}${out.length > 700 ? ' ...' : ''}`);
   return { r, out };
