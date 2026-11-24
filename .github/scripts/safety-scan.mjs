@@ -25,11 +25,16 @@ const report = args.includes('--report');
 const mintignore = args.includes('--exclude-mintignore');   // skip what .mintignore keeps out of the published docs
 const profile = args.includes('--profile') ? args[args.indexOf('--profile') + 1] : 'public';
 const allowFiles = [];
+// --lib-constants <dir,dir>: values that appear literally in these library sources (for example @polkadot, @noble)
+// are library constants (curve parameters, wasm blobs), allowed only inside bundled chunks. Our own code's data is not
+// in those libraries, so it is still caught, in bundles too.
+const libDirs = [];
 const targets = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--report' || args[i] === '--exclude-mintignore') continue;
   if (args[i] === '--profile') { i++; continue; }
   if (args[i] === '--allow-file') { allowFiles.push(args[++i]); continue; }
+  if (args[i] === '--lib-constants') { libDirs.push(...args[++i].split(',').filter(Boolean)); continue; }
   targets.push(args[i]);
 }
 if (!targets.length) { console.error('usage: scan.mjs [--report] [--profile public|private] [--allow-file F] <path>...'); process.exit(2); }
@@ -99,6 +104,20 @@ const skipPath = (p) => ignored.some((x) => p === x || p.startsWith(x + path.sep
 const walk0 = walk;
 for (const t of targets) walk0(t);
 
+const libTokens = new Set();
+if (libDirs.length) {
+  const pats = [/(?<![1-9A-HJ-NP-Za-km-z])5[1-9A-HJ-NP-Za-km-z]{46,47}(?![1-9A-HJ-NP-Za-km-z])/g, /\b0x[0-9a-fA-F]{64}\b/g];
+  const libWalk = (p) => {
+    let st; try { st = fs.lstatSync(p); } catch { return; }
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) { for (const e of fs.readdirSync(p)) libWalk(path.join(p, e)); return; }
+    if (!/\.(c?js|mjs)$/.test(p) || st.size > 16 * 1024 * 1024) return;
+    const t = fs.readFileSync(p, 'utf8');
+    for (const re of pats) { re.lastIndex = 0; let m; while ((m = re.exec(t))) libTokens.add(m[0].toLowerCase()); }
+  };
+  for (const d of libDirs) libWalk(d);
+}
+const BUNDLE = /(^|\/)_next\/static\/chunks\/[^/]+\.js$/;
 const findings = [];
 for (const f of files) {
   const buf = fs.readFileSync(f);
@@ -114,6 +133,7 @@ for (const f of files) {
       const lineNo = text.slice(0, m.index).split('\n').length;
       const line = lines[lineNo - 1] ?? '';
       if (r.ok && r.ok(m[0], line)) continue;
+      if (libTokens.size && BUNDLE.test(f) && (r.id === 'wallet-address' || r.id === 'hash-or-channel-id') && libTokens.has(m[0].toLowerCase())) continue;
       findings.push({ rule: r.id, file: f, line: lineNo, match: r.id === 'personal-name' || r.id === 'api-key' || r.id === 'key-material' ? '[redacted]' : m[0].slice(0, 70) });
     }
   }
