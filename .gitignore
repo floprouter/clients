@@ -1,0 +1,13 @@
+node_modules/
+.env*
+!.env.example
+var*/
+keys/
+logs/
+out/
+out-*/
+.next/
+.open-next/
+.wrangler/
+*.tgz
+.DS_Store

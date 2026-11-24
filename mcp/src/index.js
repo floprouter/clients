@@ -1,0 +1,329 @@
+#!/usr/bin/env node
+// floprouter MCP server. Gives an AI agent the floprouter API as tools: models, miners, paid chat
+// completions on FLOP Network, session status, balance and grant state.
+//
+//   stdio (default):        npx -y floprouter-mcp
+//   streamable HTTP:        npx -y floprouter-mcp --http [--port 8792] [--host 127.0.0.1]
+//
+// Configuration (environment):
+//   FLOPROUTER_API_KEY      router API key (fr_...). Needed for chat, balance, grants and your sessions.
+//   FLOPROUTER_BASE_URL     default https://api.floprouter.com
+//   FLOPROUTER_TIMEOUT_MS   per-request timeout, default 300000
+//
+// This server never handles wallet keys. Creating a key, signing a grant and depositing are done with the
+// floprouter CLI on your own machine.
+import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
+import { ApiError, DEFAULT_BASE_URL, costOf, isMissingRoute, makeClient, modelFacts } from './api.js';
+
+const VERSION = '0.1.0';
+const env = process.env;
+// Fallback: the file written by `floprouter login` (the CLI), so one login serves both.
+function cliConfig() {
+  const file = env.FLOPROUTER_CONFIG || path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'floprouter', 'config.json');
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+const saved = cliConfig();
+const BASE_URL = env.FLOPROUTER_BASE_URL || saved.base_url || DEFAULT_BASE_URL;
+const API_KEY = env.FLOPROUTER_API_KEY || saved.api_key;
+const SETTLE_WAIT_MS = Number(env.FLOPROUTER_SETTLE_WAIT_MS || 300_000);
+// MCP clients commonly time a tool call out at 60 s; chat answers within this budget, with an id if still running.
+const TOOL_BUDGET_MS = Number(env.FLOPROUTER_TOOL_BUDGET_MS || 50_000);
+const FINAL = new Set(['settled', 'refunded', 'failed', 'fraud', 'voided']);
+const TIMEOUT_MS = Number(env.FLOPROUTER_TIMEOUT_MS || 300_000);
+
+const json = (v) => JSON.stringify(v);
+const ok = (v) => ({ content: [{ type: 'text', text: typeof v === 'string' ? v : json(v) }] });
+const fail = (e) => {
+  // e.code is the API's reason (metadata.reason in the current error format, the string code in the earlier one).
+  const meta = e instanceof ApiError ? Object.entries(e.metadata ?? {}).filter(([k]) => k !== 'reason').map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' ') : '';
+  const msg = e instanceof ApiError
+    ? `floprouter API error ${e.status} ${e.code}: ${e.message}${meta ? ` (${meta})` : ''}`
+    : `error: ${e?.message ?? e}`;
+  return { isError: true, content: [{ type: 'text', text: msg }] };
+};
+const tool = (fn) => async (args) => { try { return await fn(args ?? {}); } catch (e) { return fail(e); } };
+
+/** Calls an endpoint that a router may not have yet; a 404 for the route itself becomes a plain note. */
+async function optional(call) {
+  try { return await call(); } catch (e) {
+    if (isMissingRoute(e)) return { unavailable: 'this router does not offer this endpoint yet' };
+    if (e instanceof ApiError && e.status === 401) return { unavailable: 'needs an API key (set FLOPROUTER_API_KEY; create one with `npx floprouter login`)' };
+    throw e;
+  }
+}
+
+function minerRow(m) {
+  const rm = m.router_measured ?? {};
+  return {
+    address: m.address, rank: m.rank ?? null, score: m.score ?? null,
+    settle_rate: m.history?.settle_rate ?? null, settled: m.history?.settled ?? null, resolved: m.history?.sessions_resolved ?? null,
+    strikes: m.slashing?.strikes ?? null, calibrated: m.calibration?.live ?? null,
+    stake: m.stake?.total ?? null,
+    models: (m.models ?? []).map((x) => x.id ?? x.name ?? x),
+    reachable: rm.reachable ?? null, ready: rm.ready ?? null, first_output_ms: rm.first_output_ms ?? null,
+  };
+}
+
+function flopSummary(f) {
+  if (!f) return null;
+  return {
+    session_id: f.session_id, status: f.status, miner: f.miner, channel_id: f.channel_id ?? null,
+    payer: f.payer?.address ?? f.payer ?? null, payer_kind: f.payer?.kind ?? null, payer_mode: f.payer?.mode ?? null,
+    payer_fallback_from: f.payer?.fallback_from ?? null,
+    escrow: f.escrow ?? null, miner_paid: f.miner_paid ?? null,
+    router_fee: f.router_fee?.amount ?? f.router_fee ?? null, router_fee_status: f.router_fee?.status ?? null, network: f.network ?? null,
+    ignored_parameters: f.ignored_parameters ?? null,
+    links: f.links ?? null,
+  };
+}
+
+export function buildServer({ apiKey } = {}) {
+  const api = makeClient({ baseUrl: BASE_URL, apiKey, timeoutMs: TIMEOUT_MS, userAgent: `floprouter-mcp/${VERSION}` });
+  const server = new McpServer({ name: 'floprouter', version: VERSION }, {
+    instructions: 'The floprouter API routes chat completions to GPU miners on FLOP Network and pays them in FLOP. ' +
+      'Use list_models to see which models are available now (available=true means at least one ready miner). ' +
+      'chat sends one paid request; it returns the reply and a session_id. Settlement on chain finishes a few minutes later: check it with session_status. ' +
+      'Each chat call spends FLOP from the user (or the router, depending on the payer mode); do not loop on it without reason.',
+  });
+
+  server.registerTool('list_models', {
+    title: 'List models',
+    description: 'Models in the FLOP on-chain registry: how many miners can serve each right now, the escrow per 1,000 tokens of prompt + max_tokens (FLOP), the minimum charge per request and the largest request served.',
+    inputSchema: { only_available: z.boolean().optional().describe('Only models with at least one ready miner') },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async ({ only_available }) => {
+    const r = await api.get('/v1/models', { auth: false });
+    let data = (r.data ?? []).map((m) => {
+      const f = modelFacts(m);
+      return {
+        id: f.id, name: f.name, available: f.available, miners_ready: f.ready, miners_reachable: f.reachable, params_billion: f.paramsBillion,
+        escrow_per_1000_tokens: f.escrowPer1k, min_charge_per_request: f.minCharge, router_fee_percent: f.routerFeePercent,
+        max_request_tokens: f.contextLength, supported_parameters: f.supportedParameters,
+      };
+    });
+    if (only_available) data = data.filter((m) => m.available);
+    return ok({ models: data, count: data.length });
+  }));
+
+  server.registerTool('list_miners', {
+    title: 'List miners',
+    description: 'Registered FLOP miners with the router\'s reliability score (0-100), rank and the public on-chain facts behind it (settle rate, sessions, strikes, calibration), plus whether the router can reach them now.',
+    inputSchema: {
+      reachable: z.boolean().optional().describe('Only miners whose session URL the router has verified and can reach'),
+      ready: z.boolean().optional().describe('Only miners that are ready to serve right now'),
+      model: z.string().optional().describe('Model id, for example qwen/qwen3-8b'),
+      min_score: z.number().optional(),
+      sort: z.enum(['score', 'settle_rate', 'sessions', 'stake', 'latency', 'capacity']).optional(),
+      limit: z.number().int().min(1).max(200).optional().describe('Default 20'),
+      offset: z.number().int().min(0).optional(),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async (a) => {
+    const r = await api.get('/v1/miners', { auth: false, query: {
+      reachable: a.reachable, ready: a.ready, model: a.model, min_score: a.min_score, sort: a.sort,
+      limit: a.limit ?? 20, offset: a.offset, view: a.reachable ? 'full' : undefined,
+    } });
+    return ok({ total: r.total ?? null, finalized_block: r.finalized_block ?? null, miners: (r.data ?? []).map(minerRow), note: r.score_note ?? undefined });
+  }));
+
+  server.registerTool('get_miner', {
+    title: 'Inspect a miner',
+    description: 'One miner in detail: score, on-chain history, stake, calibration, slashing, models with evidence, endpoints and recent channels.',
+    inputSchema: { address: z.string().min(47).max(48).describe('Miner SS58 address') },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async ({ address }) => ok(await api.get(`/v1/miners/${encodeURIComponent(address)}`, { auth: false }))));
+
+  server.registerTool('chat', {
+    title: 'Chat completion (paid)',
+    description: 'Send one chat completion to a FLOP miner through floprouter and get the reply. Spends FLOP. ' +
+      'Leave `miner` empty to let the router pick the most reliable ready miner, or pin one or more miner addresses. ' +
+      'Returns the reply text plus the session id, miner, escrow and payer. Tools/function calling are not supported by the network.',
+    inputSchema: {
+      model: z.string().describe('Model id from list_models, for example qwen/qwen3-8b'),
+      fallback_models: z.array(z.string()).optional().describe('Models to try next, in order, if no miner serves `model` (the API\'s `models` list)'),
+      prompt: z.string().optional().describe('A single user message (use this or messages)'),
+      messages: z.array(z.object({ role: z.enum(['system', 'developer', 'user', 'assistant']), content: z.string() })).optional()
+        .describe('Full conversation in OpenAI format (use this or prompt)'),
+      system: z.string().optional().describe('System prompt, used with prompt'),
+      miner: z.union([z.string(), z.array(z.string())]).optional().describe('Pin to this miner address (or try these in order)'),
+      allow_fallbacks: z.boolean().optional().describe('When pinned, allow other miners if the pinned ones fail. Default false when pinned'),
+      max_tokens: z.number().int().min(1).max(32768).optional().describe('Default set by the router (256). The escrow, and so the cost, follows max_tokens'),
+      payer: z.enum(['grant', 'credit']).optional().describe('Override the key\'s payer mode for this request'),
+      fallback_payer: z.literal('credit').optional().describe('In grant mode, run in credit mode when no miner has a live signed offer'),
+      wait_for_settlement: z.boolean().optional().describe('After the reply, poll until the on-chain settlement is final (2-5 minutes; only for clients without a tool timeout). Default false: return as soon as the reply is verified and check later with session_status'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, tool(async (a) => {
+    const messages = a.messages?.length ? a.messages
+      : a.prompt ? [...(a.system ? [{ role: 'system', content: a.system }] : []), { role: 'user', content: a.prompt }] : null;
+    if (!messages) throw new Error('give `prompt` or `messages`');
+    const pinned = a.miner ? (Array.isArray(a.miner) ? a.miner : [a.miner]) : null;
+    const body = {
+      model: a.model, messages, max_tokens: a.max_tokens,
+      ...(a.fallback_models?.length ? { models: a.fallback_models } : {}),
+      ...(pinned ? { provider: a.allow_fallbacks ? { order: pinned } : { only: pinned } } : {}),
+      // The server is never asked to hold the response until settlement (a silent response is cut by proxies).
+      flop: { wait_for_settlement: false, ...(a.payer ? { payer: a.payer } : {}), ...(a.fallback_payer ? { fallback_payer: a.fallback_payer } : {}) },
+    };
+    // Streamed internally: the generation id arrives with the response headers (or the first chunk), so when the
+    // reply takes longer than the tool budget (MCP clients commonly give up after 60 s) the agent still gets an id to
+    // check later. Closing the stream does not cancel the session: it completes and settles on the router.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(new Error('tool budget')), TOOL_BUDGET_MS);
+    let id = null; let headers = null; let content = ''; let finish = null; let usage = null; let flop = null; let model = null;
+    try {
+      await api.stream('/v1/chat/completions', { ...body, stream: true }, {
+        signal: ctl.signal,
+        onHeaders: (h) => { headers = h; id = h.get('x-generation-id') ?? id; },
+        onEvent: (ev) => {
+          id = ev.id ?? id; model = ev.model ?? model;
+          for (const c of ev.choices ?? []) { content += c.delta?.content ?? ''; finish = c.finish_reason ?? finish; }
+          if (ev.usage) usage = ev.usage;
+          if (ev.flop) flop = ev.flop;
+        },
+      });
+    } catch (e) {
+      if (!ctl.signal.aborted) throw e;
+      return ok({
+        pending: true, generation_id: id,
+        message: id ? `no verified reply within ${Math.round(TOOL_BUDGET_MS / 1000)} s; the request continues on the router. Call generation (or session_status) with this id in a minute.`
+          : `no reply within ${Math.round(TOOL_BUDGET_MS / 1000)} s and no id yet; the request may still complete. Check your recent sessions later.`,
+      });
+    } finally { clearTimeout(timer); }
+    if (a.wait_for_settlement && flop?.session_id) {
+      const t0 = Date.now();
+      for (;;) {
+        const s2 = await api.get(`/v1/sessions/${encodeURIComponent(flop.session_id)}`);
+        flop = s2;
+        if (FINAL.has(s2.status) || Date.now() - t0 > SETTLE_WAIT_MS) break;
+        await new Promise((res) => setTimeout(res, 10_000));
+      }
+    }
+    const ignored = (headers?.get('x-floprouter-ignored-parameters') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+    return ok({
+      reply: content, finish_reason: finish, model,
+      generation_id: id ?? flop?.session_id ?? null,
+      cost_flop: costOf({ usage }), cost_final: usage?.cost_details?.final ?? null,
+      ignored_parameters: ignored.length ? ignored : flop?.ignored_parameters ?? [],
+      usage: usage ? { prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, total_tokens: usage.total_tokens } : null,
+      flop: flopSummary(flop),
+    });
+  }));
+
+  server.registerTool('session_status', {
+    title: 'Session status',
+    description: 'Settlement state of a chat session: status (settling, settled, refunded, failed...), channel id, miner, escrow, amount paid to the miner, attempts and explorer links.',
+    inputSchema: { session_id: z.string().min(6).max(64) },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async ({ session_id }) => ok(await api.get(`/v1/sessions/${encodeURIComponent(session_id)}`))));
+
+  server.registerTool('generation', {
+    title: 'Generation stats',
+    description: 'One request by its id (gen-...): tokens, cost in FLOP (final once settled), finish reason, latency, the verified reply, and the session. Needs the key of the wallet that made it.',
+    inputSchema: { id: z.string().min(6).max(128).describe('The generation id returned by chat (same as the session id)') },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async ({ id }) => {
+    try {
+      const g = (await api.get('/v1/generation', { query: { id } }))?.data ?? null;
+      return ok(g);
+    } catch (e) {
+      if (!isMissingRoute(e)) throw e;
+      return ok({ note: 'this router has no /v1/generation; this is the session record', session: await api.get(`/v1/sessions/${encodeURIComponent(id)}`) });
+    }
+  }));
+
+  server.registerTool('account', {
+    title: 'Balance, key and grant',
+    description: 'The calling wallet\'s prepaid FLOP balance (available, held, deposit address, fee, recent ledger entries, withdrawals), this API key\'s usage in FLOP and rate limits, and the state of its on-chain session-key grant. Needs an API key.',
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async () => {
+    if (!api.hasKey) return ok({ unavailable: 'no API key configured: set FLOPROUTER_API_KEY (create one with `npx floprouter login`)' });
+    const [balance, key, grant] = await Promise.all([
+      optional(() => api.get('/v1/balance')), optional(async () => (await api.get('/v1/key'))?.data ?? null), optional(() => api.get('/v1/grants')),
+    ]);
+    if (balance?.recent) balance.recent = balance.recent.slice(0, 10);
+    return ok({ balance, key, grant });
+  }));
+
+  server.registerTool('withdraw', {
+    title: 'Withdraw prepaid balance',
+    description: 'Send prepaid FLOP from the router balance back to the wallet that owns this API key (the only destination the API allows). The chain fee is taken out of the amount. Only use when the user asks for it.',
+    inputSchema: { amount: z.string().regex(/^(all|\d+(\.\d+)?)$/).describe('Decimal FLOP, or "all" for the whole available balance') },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, tool(async ({ amount }) => {
+    if (!api.hasKey) return ok({ unavailable: 'no API key configured' });
+    try { return ok(await api.post('/v1/balance/withdraw', { amount })); } catch (e) {
+      if (isMissingRoute(e)) return ok({ unavailable: 'this router does not offer withdrawals yet' });
+      throw e;
+    }
+  }));
+
+  server.registerTool('router_status', {
+    title: 'Router status',
+    description: 'Network, sync state, number of miners and verified endpoints, and which wallet pays for sessions.',
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, tool(async () => {
+    const h = await api.get('/health', { auth: false });
+    return ok({
+      status: h.status, network: h.network, finalized_block: h.finalized_block,
+      miners: h.registry?.miners ?? null, models: h.registry?.models ?? null,
+      endpoints_verified: h.endpoints?.verified ?? null, endpoints_ready: h.endpoints?.verified_ready ?? null,
+      payer: h.payer ?? null, base_url: api.base,
+    });
+  }));
+
+  return server;
+}
+
+function argValue(name, fallback) {
+  const i = process.argv.indexOf(name);
+  return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+}
+
+async function main() {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    process.stdout.write(`floprouter-mcp ${VERSION}\n\n  floprouter-mcp                 stdio transport (for Claude Code, Claude Desktop, Cursor, Codex)\n  floprouter-mcp --http          streamable HTTP on http://127.0.0.1:8792/mcp\n      --port <n> --host <addr>\n\nEnvironment: FLOPROUTER_API_KEY (else the key saved by "floprouter login"),\n             FLOPROUTER_BASE_URL (default ${DEFAULT_BASE_URL}), FLOPROUTER_TIMEOUT_MS, FLOPROUTER_SETTLE_WAIT_MS\n`);
+    return;
+  }
+  if (process.argv.includes('--version')) { process.stdout.write(VERSION + '\n'); return; }
+
+  if (!process.argv.includes('--http')) {
+    const server = buildServer({ apiKey: API_KEY });
+    await server.connect(new StdioServerTransport());
+    process.stderr.write(`floprouter-mcp ${VERSION} on stdio, router ${BASE_URL}${API_KEY ? '' : ' (no API key: read-only tools only)'}\n`);
+    return;
+  }
+
+  // Streamable HTTP, stateless: one server and transport per request. A request may carry its own router key in
+  // `Authorization: Bearer fr_...`; otherwise FLOPROUTER_API_KEY is used.
+  const port = Number(argValue('--port', env.PORT || 8792));
+  const host = argValue('--host', '127.0.0.1');
+  const httpServer = http.createServer(async (req, res) => {
+    const path = new URL(req.url ?? '/', 'http://x').pathname;
+    if (path === '/health') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(json({ ok: true, version: VERSION })); }
+    if (path !== '/mcp') { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(json({ error: 'use /mcp' })); }
+    if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); return res.end(); }
+    const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
+    const server = buildServer({ apiKey: m ? m[1] : API_KEY });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => { void transport.close(); void server.close(); });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (e) {
+      if (!res.headersSent) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(json({ jsonrpc: '2.0', error: { code: -32603, message: String(e?.message ?? e) }, id: null })); }
+    }
+  });
+  httpServer.listen(port, host, () => process.stderr.write(`floprouter-mcp ${VERSION} on http://${host}:${port}/mcp, router ${BASE_URL}\n`));
+}
+
+main().catch((e) => { process.stderr.write(`floprouter-mcp: ${e?.stack ?? e}\n`); process.exit(1); });

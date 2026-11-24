@@ -1,0 +1,38 @@
+{
+  "name": "floprouter",
+  "version": "0.1.0",
+  "description": "Command-line client for the floprouter API: FLOP Network miners and models, paid chat completions, and local wallet signing for login, grants, deposits and withdrawals",
+  "author": "floprouter",
+  "license": "MIT",
+  "homepage": "https://floprouter.com",
+  "type": "module",
+  "bin": {
+    "floprouter": "bin/floprouter.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node test/offline.mjs",
+    "prepublishOnly": "node scripts/prepublish-check.mjs"
+  },
+  "keywords": [
+    "floprouter",
+    "flop",
+    "cli",
+    "llm",
+    "inference",
+    "substrate"
+  ],
+  "dependencies": {
+    "@polkadot/api": "^17.0.2",
+    "@polkadot/keyring": "^14.0.3",
+    "@polkadot/util": "^14.0.3",
+    "@polkadot/util-crypto": "^14.0.3"
+  }
+}
