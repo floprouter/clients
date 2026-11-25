@@ -1,7 +1,7 @@
 // floprouter CLI commands.
 import readline from 'node:readline';
-import { ApiError, costOf, headersOf, isMissingRoute, modelFacts } from './api.js';
-import { ALLOWED_PALLETS, checkGrantParams, checkRenewalCall, decideRenewal, grantFacts, grantOf, parseDuration, readGrantParams, renewIfDue } from './renewal.js';
+import { ApiError, costOf, makeClient, headersOf, isMissingRoute, modelFacts } from './api.js';
+import { ALLOWED_PALLETS, FEE_PALLETS, buildBatchTx, checkGrantBatch, checkGrantParams, checkRenewalCall, decideRenewal, chainError, explainChainError, grantFacts, grantOf, hasFeeGrant, knownDelegates, parseDuration, readGrantParams, renewIfDue, validAddresses } from './renewal.js';
 
 export { decideRenewal, grantFacts, parseDuration, readGrantParams };
 import { bold, confirm, dim, err, flopAmount, green, pct, printJson, readConfig, red, short, table, writeConfig, yellow } from './io.js';
@@ -99,7 +99,7 @@ export async function session(ctx, o, id) {
   }
   const s = await ctx.api.get(`/v1/sessions/${encodeURIComponent(id)}`);
   if (o.json) return printJson(s);
-  const kv = (k, v) => console.log(`${dim(k.padEnd(14))}${v ?? '-'}`);
+  const kv = (k, v) => console.log(`${dim(k.padEnd(16))}${v ?? '-'}`);
   kv('session', s.session_id); kv('status', s.status); kv('model', s.model); kv('miner', s.miner); kv('channel', s.channel_id);
   kv('payer', s.payer ? `${s.payer.address} (${s.payer.kind})` : null);
   kv('escrow', s.escrow ? `${s.escrow} ${s.currency ?? 'FLOP'}` : null); kv('miner paid', s.miner_paid);
@@ -283,7 +283,6 @@ export async function login(ctx, o) {
   if (!/API key/i.test(ch.challenge)) throw new Error('unexpected challenge text from the router; refusing to sign');
   err(dim(ch.challenge.split('\n').map((l) => `  | ${l}`).join('\n')));
   const signature = await signChallenge(pair, ch.challenge, { wrap: Boolean(o['wrap-bytes']) });
-  pair.lock?.();
   const r = await ctx.api.post('/v1/auth/keys', {
     address: pair.address, challenge: ch.challenge, signature,
     ...(o.name ? { name: o.name } : {}), ...(o.payer ? { payer: o.payer } : {}),
@@ -291,6 +290,7 @@ export async function login(ctx, o) {
   if (!r?.key) throw new Error('router returned no key');
   const who = r.address ?? pair.address;
   if (o['no-save']) {
+    pair.lock?.();
     err(yellow('Not saved (--no-save). This is the only time the key is shown:'));
     process.stdout.write(r.key + '\n');
     return;
@@ -300,8 +300,33 @@ export async function login(ctx, o) {
   err('The CLI and floprouter-mcp read it from there.');
   if (o['show-key']) process.stdout.write(`export FLOPROUTER_API_KEY=${r.key}\n`);
   else err(dim('To use it in another tool: floprouter key --show   (treat it like a password)'));
-  if ((r.payer_mode ?? 'grant') === 'grant') err(dim('Next: floprouter grant   (one signature; your wallet then pays each session on chain)'));
-  else err(dim('Next: floprouter deposit <amount>   (credit mode: the router pays sessions from your prepaid balance)'));
+  if ((r.payer_mode ?? 'grant') !== 'grant') {
+    pair.lock?.();
+    return err(dim('Next: floprouter deposit <amount>   (credit mode: the router pays sessions from your prepaid balance)'));
+  }
+  // Grant mode: finish the sign-up with the one grant signature, using the wallet that is already unlocked.
+  // Nothing more is asked than `grant` asks today (its summary and one confirmation; --yes skips it).
+  if (o['no-grant']) { pair.lock?.(); return err(dim('Next: floprouter grant   (one signature; your wallet then pays each session on chain)')); }
+  if (!o.yes && !process.stdin.isTTY) { pair.lock?.(); return err(dim('No terminal to confirm on. Next: floprouter grant --yes   (one signature; your wallet then pays each session on chain)')); }
+  const ctx2 = { api: ctx.withKey ? ctx.withKey(r.key) : makeClient({ baseUrl: ctx.api.base, apiKey: r.key, userAgent: 'floprouter-cli', title: 'floprouter CLI' }) };
+  try {
+    if (await alreadyGranted(ctx2, o)) { err(green('Your grant is already active: nothing more to sign.')); return; }
+    err(dim('\nOne more step: the grant, so the router can pay for sessions from your wallet.'));
+    await grant(ctx2, { ...o, revoke: false, status: false, 'auto-renew': false }, { pair, say: (m) => err(m) });
+  } catch (e) {
+    err(yellow(`The API key is saved, but the grant was not completed: ${describe(e)}`));
+    err('Run `floprouter grant` to try again.');
+    process.exitCode = 1;
+  } finally { pair.lock?.(); }
+}
+
+/** True when this wallet needs nothing signed: an active compute grant that is not due, and (in fee mode) an active fee grant. */
+async function alreadyGranted(ctx, o) {
+  let g; try { g = await ctx.api.post('/v1/grants/sync', {}); } catch { return false; }
+  const f = grantFacts(g);
+  if (f.state !== 'active' || decideRenewal(f).action !== 'skip') return false;
+  if (o['no-fee-grant'] || g?.fees?.mode === 'prepaid') return true;
+  return grantOf(g, undefined, 'fee')?.state === 'active';
 }
 
 export async function keys(ctx, o, args) {
@@ -332,12 +357,20 @@ export async function balance(ctx, o) {
   let g = null;
   try { g = await ctx.api.get('/v1/grants'); } catch (e) { if (!(e instanceof ApiError && (e.status === 404 || e.status === 503))) throw e; }
   if (o.json) return printJson({ balance: b, grants: g });
-  const kv = (k, v) => console.log(`${dim(k.padEnd(14))}${v ?? '-'}`);
+  const kv = (k, v) => console.log(`${dim(k.padEnd(16))}${v ?? '-'}`);
   kv('wallet', b.address);
   kv('balance', `${b.balance} ${b.currency ?? 'FLOP'}${b.held && Number(b.held) > 0 ? ` (held ${b.held}, available ${b.available})` : ''}`);
   kv('deposit to', b.deposit_address ?? 'deposits not enabled on this router');
   kv('router fee', b.fee_percent !== undefined ? `${b.fee_percent}% of escrow, only for sessions that settle paid` : null);
   kv('grant', describeGrant(g));
+  const fees = b.fees ?? g?.fees ?? null;
+  if (fees || grantOf(g, undefined, 'fee')) {
+    kv('fees', describeFees(fees));
+    const lc = fees?.last_collection;
+    if (lc) kv('last collection', `${lc.amount} FLOP${lc.block !== undefined ? ` at block ${lc.block}` : ''}, ${txLink(lc.tx, b.explorer_url ?? g?.explorer_url ?? fees?.explorer_url)}`);
+    kv('fee grant', describeGrant(g, 'fee', fees));
+    if (fees && Number(fees.owed) > 0 && grantOf(g, undefined, 'fee')?.state !== 'active') console.log(dim('                Fees are owed and no fee grant is active: run `floprouter grant` (one signature) or `floprouter deposit <amount>`.'));
+  }
   const wd = b.withdrawals;
   if (wd && !Array.isArray(wd)) kv('withdrawals', wd.enabled ? `enabled, at least ${wd.min} FLOP: floprouter withdraw <amount|all>` : 'not enabled on this router');
   for (const w of (Array.isArray(wd) ? wd : wd?.recent ?? []).slice(0, 3)) kv('withdrawal', `${w.status} ${w.sent ?? w.requested} FLOP ${w.tx ?? ''} ${w.created_at ?? ''}`);
@@ -350,18 +383,31 @@ export async function balance(ctx, o) {
   }
 }
 
-function describeGrant(g) {
-  const x = grantOf(g);
+function describeGrant(g, kind = 'compute', fees = null) {
+  const x = grantOf(g, undefined, kind);
+  if (kind === 'fee' && !x) return fees?.mode === 'prepaid' ? 'not used: the fee is taken from your prepaid balance' : 'none (run `floprouter grant` for deposit-free fees)';
   if (x?.state === 'waiting_for_finality') {
     const pnd = x.pending ?? {};
     return yellow(`waiting for finality: in block ${pnd.best_block ?? '?'}, final up to ${pnd.finalized_block ?? '?'}; reads as ${pnd.at_best ?? 'the new state'} once final`);
   }
-  if (x?.state === 'revoked') return 'revoked (run `floprouter grant` to grant again)';
-  if (!x || x.state === 'assigned' || (!x.active && x.state !== 'expired')) return 'none (run `floprouter grant`)';
+  if (x?.state === 'revoked') return `revoked (run \`floprouter grant\` to grant again)`;
+  if (!x || x.state === 'assigned' || (!x.active && x.state !== 'expired')) return `none (run \`floprouter grant\`)`;
   if (x.state === 'expired' || !x.active) return yellow(`${x.state}: sign a new one with \`floprouter grant\``);
   return [green(x.state ?? 'active'), x.remaining && `${x.remaining} of ${x.spending_cap} FLOP left`,
-    x.epoch_room && `${x.epoch_room} left today`, x.sessions_left_estimate !== null && x.sessions_left_estimate !== undefined && `about ${x.sessions_left_estimate} sessions`,
+    kind !== 'fee' && x.epoch_room && `${x.epoch_room} left today`, kind !== 'fee' && x.sessions_left_estimate !== null && x.sessions_left_estimate !== undefined && `about ${x.sessions_left_estimate} sessions`,
     x.expires_at && `expires ${x.expires_at.slice(0, 16).replace('T', ' ')} UTC`].filter(Boolean).join(', ');
+}
+
+function describeFees(f) {
+  if (!f) return null;
+  const how = f.mode === 'grant_accrual' ? 'deposit-free: collected from your wallet through the fee grant' : 'taken from your prepaid balance';
+  return `${how}; accrued ${f.accrued}, collected ${f.collected}, owed ${f.owed} FLOP`;
+}
+
+/** A transaction as a link when the explorer's URL is known, else its hash. */
+function txLink(tx, explorerUrl) {
+  if (!tx) return '-';
+  return explorerUrl ? `${String(explorerUrl).replace(/\/+$/, '')}/transactions/${tx}` : `tx ${tx}`;
 }
 
 // ---- signing commands: grant, deposit ---------------------------------------------------------------------------
@@ -388,22 +434,18 @@ export async function grant(ctx, o, preset = {}) {
   const pair = preset.pair ?? await loadSigner(signerOpts(o));
   const p = preset.params ?? readGrantParams(await ctx.api.get('/v1/grants/params', { query: ctx.api.hasKey ? {} : { address: pair.address } }));
   checkGrantParams(p, pair.address, await isValidAddress(p.delegate ?? ''));
+  // Deposit-free fees: one signature for the compute grant and the fee grant. --no-fee-grant keeps the compute-only
+  // grant (the fee is then taken from a prepaid deposit). The router's batch is checked before any chain access.
+  const plan = p.feeCall && !o['no-fee-grant'] && !o.revoke ? await feePlan(ctx, o, preset, p, isValidAddress) : null;
   const { api } = preset.chain ?? await chainContext(ctx, o, p);
   try {
     const blocksPerHour = Number(api.consts.flopSessionKeys?.blocksPerHour?.toString() ?? 3600);
     const chainMax = Number(api.consts.flopSessionKeys?.maxSessionDuration?.toString() ?? 864000);
     const maxDur = Math.min(chainMax, Number(p.maxDurationBlocks ?? chainMax));
 
-    if (o.revoke) {
-      const existing = await api.query.flopSessionKeys.sessions(pair.address, p.delegate);
-      if (existing.isNone) { err('no grant to this router delegate on chain'); return; }
-      err(`Revoke the grant from ${pair.address} to the router delegate ${p.delegate}.`);
-      if (!(await confirm('Sign and submit?', o))) return err('cancelled');
-      const r = await signAndWait(api, api.tx.flopSessionKeys.revokeSession(p.delegate), pair, (st) => err(dim(`  ${st}`)));
-      err(green(`revoked in block ${r.block} (tx ${r.tx})`));
-      await syncGrant(ctx, { delegate: p.delegate, expect: 'gone' });
-      return;
-    }
+    if (o.revoke) return await revokeAll(ctx, o, { api, pair, p, signAndWait });
+
+    if (plan) return await grantWithFee(ctx, o, { api, pair, p, plan, preset, say, blocksPerHour, signAndWait, fromRaw });
 
     const want = {
       spendingCap: String(pick(o['spending-cap'], preset.caps?.spendingCap, p.spendingCap, '5')),
@@ -413,26 +455,38 @@ export async function grant(ctx, o, preset = {}) {
       feeFloat: String(pick(o['fee-float'], p.feeFloat, '0')),
     };
     if (!(want.durationBlocks > 0) || want.durationBlocks > maxDur) throw new Error(`duration ${want.durationBlocks} blocks is outside 1..${maxDur}`);
-    const raw = { cap: await toRaw(api, want.spendingCap), tx: await toRaw(api, want.perTxLimit), day: await toRaw(api, want.dailyCap), float: await toRaw(api, want.feeFloat) };
+    const existing = await api.query.flopSessionKeys.sessions(pair.address, p.delegate);
+    const active = existing.isSome && existing.unwrap().active?.isTrue === true;
+    // A fee-mode router (with --no-fee-grant) states the compute caps in `amounts` only when it puts a compute grant in
+    // its batch; for an active compute grant it states that grant's own caps there, and `call` carries its defaults.
+    const computeInBatch = !p.calls || p.calls.some((c) => c?.method === 'createSession' && c.args?.[0] === p.delegate);
+    const ownCaps = o['spending-cap'] || o['per-tx'] || o['daily-cap'] || preset.caps;
+    if (p.feeCall && active && !computeInBatch && !ownCaps && !o.days) {
+      err('You already have an active compute grant, and --no-fee-grant leaves it as it is: nothing to sign.');
+      err(dim('To change its caps run `floprouter grant --no-fee-grant --spending-cap <FLOP> --per-tx <FLOP> --daily-cap <FLOP>`; to add deposit-free fees run `floprouter grant`.'));
+      return null;
+    }
+    const callCaps = p.feeCall && !ownCaps && p.argRaw && !computeInBatch;
+    const raw = callCaps
+      ? { cap: BigInt(p.argRaw.cap), tx: BigInt(p.argRaw.tx), day: BigInt(p.argRaw.day), float: await toRaw(api, want.feeFloat) }
+      : { cap: await toRaw(api, want.spendingCap), tx: await toRaw(api, want.perTxLimit), day: await toRaw(api, want.dailyCap), float: await toRaw(api, want.feeFloat) };
+    if (callCaps) { want.spendingCap = fromRaw(api, raw.cap); want.perTxLimit = fromRaw(api, raw.tx); want.dailyCap = fromRaw(api, raw.day); }
     if (raw.cap <= 0n || raw.tx <= 0n || raw.day <= 0n) throw new Error('caps must be positive');
     if (raw.tx > raw.cap || raw.day > raw.cap) throw new Error('per-transaction and daily caps cannot exceed the spending cap');
     // The router's own call must say the same as its amounts (unless the caps were chosen here on purpose).
-    const ownCaps = o['spending-cap'] || o['per-tx'] || o['daily-cap'] || preset.caps;
-    if (p.argRaw && !ownCaps && p.spendingCap
+    if (p.argRaw && !ownCaps && p.spendingCap && !callCaps
       && (String(p.argRaw.cap) !== raw.cap.toString() || String(p.argRaw.tx) !== raw.tx.toString() || String(p.argRaw.day) !== raw.day.toString())) {
       throw new Error('the router\'s call arguments do not match its stated amounts; refusing to sign');
     }
     const maxFloat = await toRaw(api, String(o['max-float'] ?? MAX_FLOAT_DEFAULT));
     if (raw.float > maxFloat) throw new Error(`fee float ${want.feeFloat} FLOP is above --max-float ${o['max-float'] ?? MAX_FLOAT_DEFAULT}`);
 
-    const existing = await api.query.flopSessionKeys.sessions(pair.address, p.delegate);
-    const active = existing.isSome && existing.unwrap().active?.isTrue === true;
     const create = api.tx.flopSessionKeys.createSession(p.delegate, raw.cap, raw.tx, raw.day, want.durationBlocks, ALLOWED_PALLETS);
     // The chain refuses a second createSession while a grant to the same delegate is active
     // (SessionAlreadyExists), so a renewal is revokeSession + createSession in one batchAll: one signature, and
     // if either part fails nothing changes. Built here, from the chain's own state; the router's renewal_call, when it
     // sends one, must describe exactly that batch.
-    if (active && p.renewalCall) checkRenewalCall(p.renewalCall, p.delegate);
+    if (active && p.renewalCall && !p.feeCall) checkRenewalCall(p.renewalCall, p.delegate);
     if (active && p.renewal === false && p.renewalCall === null && 'renewal' in (p.raw ?? {})) {
       err(dim('the router does not see the active grant yet (it reads its finalized block); renewing from the chain state'));
     }
@@ -455,7 +509,9 @@ export async function grant(ctx, o, preset = {}) {
     if (active) say(`  renews                your active grant: revoke and new grant in one transaction (one signature)`);
     if (preset.reason) say(`  why                   ${preset.reason}`);
     say(dim('  Within these caps the router opens compute channels that your wallet pays for. Revoke any time:'));
-    say(dim('  floprouter grant --revoke\n'));
+    say(dim('  floprouter grant --revoke'));
+    if (p.feeCall) say(dim('  No fee grant here (--no-fee-grant): the router fee is taken from your prepaid balance, so deposit first: floprouter deposit <amount>'));
+    say('');
     if (!(await confirm('Sign and submit?', o))) { err('cancelled'); return null; }
     const r = await signAndWait(api, tx, pair, (st) => err(dim(`  ${st}`)));
     pair.lock?.();
@@ -464,6 +520,83 @@ export async function grant(ctx, o, preset = {}) {
     await syncGrant(ctx, { delegate: p.delegate, expect: 'active', cap: want.spendingCap, maxMs: preset.syncMaxMs });
     return { tx: r.tx, block: r.block, renewed: active, caps: want };
   } finally { if (!preset.chain) await api.disconnect(); }
+}
+
+/** Every grant of this wallet to the router that is active on chain: compute and fee delegates (the router's list, plus those named in the params). */
+async function activeDelegates(ctx, { api, pair, p }) {
+  let listed = [];
+  if (ctx.api.hasKey) { try { listed = knownDelegates(await ctx.api.post('/v1/grants/sync', {})); } catch { /* the params still name the current ones */ } }
+  const out = [];
+  for (const d of new Set([...listed, p.delegate, p.feeDelegate].filter(Boolean))) {
+    const rec = await api.query.flopSessionKeys.sessions(pair.address, d);
+    if (rec.isSome && rec.unwrap().active?.isTrue === true) out.push(d);
+  }
+  return out;
+}
+
+/** --revoke: one transaction that revokes every active grant of this wallet to the router (compute and fee). */
+async function revokeAll(ctx, o, { api, pair, p, signAndWait }) {
+  const targets = await activeDelegates(ctx, { api, pair, p });
+  if (!targets.length) { err('no grant to the router on chain'); return null; }
+  err(`Revoke ${targets.length > 1 ? 'these grants' : 'this grant'} from ${pair.address}:`);
+  for (const d of targets) err(`  ${d}${d === p.feeDelegate ? '  (fee grant)' : d === p.delegate ? '  (compute grant)' : ''}`);
+  if (!(await confirm('Sign and submit?', o))) return err('cancelled');
+  const revokes = targets.map((d) => api.tx.flopSessionKeys.revokeSession(d));
+  const r = await signAndWait(api, revokes.length === 1 ? revokes[0] : api.tx.utility.batchAll(revokes), pair, (st) => err(dim(`  ${st}`)));
+  err(green(`revoked in block ${r.block} (tx ${r.tx})`));
+  await syncGrant(ctx, { delegate: p.delegate, expect: 'gone' });
+  return null;
+}
+
+/** The router's one-signature batch, checked against this wallet's known grants (pure checks; no chain access). */
+async function feePlan(ctx, o, preset, p, isValidAddress) {
+  const chosen = ['spending-cap', 'per-tx', 'daily-cap', 'days', 'fee-float'].filter((k) => o[k] !== undefined);
+  if (chosen.length || preset.caps) {
+    throw new Error(`--${chosen[0] ?? 'spending-cap'} cannot change the router's one-signature grant (the router sets its caps). `
+      + 'To choose your own caps use `floprouter grant --no-fee-grant ...` (compute-only grant; the fee is then paid from a deposit).');
+  }
+  let known = [];
+  if (ctx.api.hasKey) {
+    try { known = knownDelegates(await ctx.api.post('/v1/grants/sync', {})); } catch (e) { err(dim(`could not list your current grants (${describe(e)}); continuing with the router's own delegates`)); }
+  }
+  return checkGrantBatch(p, known, { valid: await validAddresses(p, isValidAddress) });
+}
+
+/** The one-signature sign-up: the checked batch of compute grant + fee grant, shown and signed. */
+async function grantWithFee(ctx, o, { api, pair, p, plan, preset, say, blocksPerHour, signAndWait, fromRaw }) {
+  const tx = buildBatchTx(api, plan, p.callData);
+  let pctFee = null;
+  if (ctx.api.hasKey) { try { pctFee = (await ctx.api.get('/v1/balance'))?.fee_percent ?? null; } catch { /* optional */ } }
+  const fl = (v) => fromRaw(api, v);
+  const c = plan.compute; const f = plan.fee;
+  const span = (blocks) => { const h = blocks / blocksPerHour; return h < 48 ? `${h.toFixed(1)} hours` : `${(h / 24).toFixed(1)} days`; };
+  const acct = await api.query.system.account(pair.address);
+  say(bold(plan.shape === 'add_fee' ? '\nDeposit-free fees: add the fee grant (your compute grant stays as it is)' : `\nSession-key grants${plan.shape === 'renewal' ? ' (renewal)' : ''}: one transaction, one signature`));
+  say(`  your wallet (payer)   ${pair.address}  balance ${fl(acct.data.free.toString())} FLOP`);
+  for (const d of plan.revokes) say(`  replaces              your current grant to ${d} (${d === p.feeDelegate ? 'fee' : d === p.delegate ? 'compute' : 'earlier fee delegate'})`);
+  if (c) {
+    say(`  compute grant         to the router delegate ${c.delegate}`);
+    say(`    allowed             ${ALLOWED_PALLETS.join(', ')} only (compute channels; no transfers)`);
+    say(`    spending cap        ${fl(c.cap)} FLOP in total, ${fl(c.tx)} per session, ${fl(c.day)} per day`);
+    say(`    duration            ${c.duration} blocks (about ${span(c.duration)})`);
+  }
+  say(`  fee grant             to the fee delegate ${f.delegate}`);
+  say(`    allowed             ${FEE_PALLETS.join(', ')} only`);
+  say(`    fee cap             ${fl(f.cap)} FLOP in total, ${fl(f.tx)} per payment, ${fl(f.day)} per day`);
+  if (!c) say(`    duration            ${f.duration} blocks (about ${span(f.duration)})`);
+  say(`    the router collects its fee${pctFee !== null ? ` (${pctFee}% of the escrow)` : ''} from your wallet with it, paid to ${plan.feeAddress}`);
+  if (preset.reason) say(`  why                   ${preset.reason}`);
+  say(dim('  The chain limits what the router can do with each grant to the pallet and caps above; the router sends the fee'));
+  say(dim('  only to the address shown. No deposit is needed. Revoke both any time: floprouter grant --revoke'));
+  say(dim('  To pay the fee from a deposit instead: floprouter grant --no-fee-grant, then floprouter deposit <amount>.'));
+  say('');
+  if (!(await confirm('Sign and submit?', o))) { err('cancelled'); return null; }
+  let r;
+  try { r = await signAndWait(api, tx, pair, (st) => err(dim(`  ${st}`))); } catch (e) { throw chainError(e, p.maxRotations); }
+  pair.lock?.();
+  err(green(`${plan.shape === 'add_fee' ? 'fee grant created' : plan.shape === 'renewal' ? 'grants renewed' : 'grants created'}, finalized in block ${r.block} (tx ${r.tx})`));
+  await syncGrant(ctx, { delegate: p.delegate, feeDelegate: f.delegate, expect: 'active', cap: c ? fl(c.cap) : undefined, maxMs: preset.syncMaxMs });
+  return { tx: r.tx, block: r.block, renewed: plan.shape === 'renewal', shape: plan.shape, caps: c ? { spendingCap: fl(c.cap), perTxLimit: fl(c.tx), dailyCap: fl(c.day) } : null, fee_caps: { spendingCap: fl(f.cap), perTxLimit: fl(f.tx), dailyCap: fl(f.day) } };
 }
 
 /**
@@ -482,7 +615,7 @@ export async function autoRenew(ctx, o) {
   if (caps && (!caps.spendingCap || !caps.perTxLimit || !caps.dailyCap)) throw new Error('to change the caps on renewal give all three: --spending-cap, --per-tx and --daily-cap');
   const wallet = await import('./wallet.js');
   const r = await renewIfDue({
-    client: ctx.api, wallet, key: signerOpts(o), rpc: o.rpc, days: o.days, caps, sameCaps: !caps, keepHeadroom: true, allowCreate: true, dryRun: Boolean(o['dry-run']),
+    client: ctx.api, wallet, key: signerOpts(o), rpc: o.rpc, days: o.days, caps, sameCaps: !caps, keepHeadroom: true, allowCreate: true, dryRun: Boolean(o['dry-run']), feeGrant: !o['no-fee-grant'],
     opts: { renewBeforeSec: parseDuration(o['renew-before'] ?? '2d'), minRemaining: o['min-remaining'] !== undefined ? Number(o['min-remaining']) : null,
       minDaily: o['min-daily'] !== undefined ? Number(o['min-daily']) : null },
     log: (m) => err(dim(m)),
@@ -490,7 +623,7 @@ export async function autoRenew(ctx, o) {
   if (r.action === 'skip' || r.action === 'wait') err(`${r.action === 'skip' ? 'grant ok' : 'grant pending'}: ${r.reason}. Nothing to do.`);
   if (r.note) err(yellow(r.note));
   else if (r.dry_run) err(yellow(`would ${r.action} (${r.reason}); --dry-run, nothing signed`));
-  else if (r.tx) err(green(`${r.action === 'renew' ? 'renewed' : 'granted'} (${r.reason}): tx ${r.tx}, block ${r.block}`));
+  else if (r.tx) err(green(`${r.action === 'renew' ? 'renewed' : r.action === 'add_fee' ? 'fee grant added' : 'granted'} (${r.reason}): tx ${r.tx}, block ${r.block}`));
   if (o.json) printJson(r);
   if (r.action === 'refused') throw new Error(r.reason);
 }
@@ -500,11 +633,15 @@ async function grantStatus(ctx, o) {
   if (!g) throw new Error('needs an API key: run `floprouter login`');
   const x = grantOf(g);
   const f = grantFacts(g, x?.delegate);
+  const fx = grantOf(g, undefined, 'fee');
   const d = decideRenewal(f, { renewBeforeSec: parseDuration(o['renew-before'] ?? '2d'),
     minRemaining: o['min-remaining'] !== undefined ? Number(o['min-remaining']) : null, minDaily: o['min-daily'] !== undefined ? Number(o['min-daily']) : null });
   // Stable shape for scripts: the facts in plain numbers, and what --auto-renew would do now.
-  if (o.json) return printJson({ address: g.address ?? null, ...f, needs_renewal: d.action === 'grant' || d.action === 'renew', auto_renew_action: d.action, reason: d.reason });
+  if (o.json) return printJson({ address: g.address ?? null, ...f, needs_renewal: d.action === 'grant' || d.action === 'renew', auto_renew_action: d.action, reason: d.reason,
+    fee_grant: fx ? grantFacts(g, fx.delegate, Date.now(), 'fee') : null, fees: g.fees ?? null });
   console.log(describeGrant(g));
+  if (fx || g.fees) console.log(`fee grant: ${describeGrant(g, 'fee', g.fees)}`);
+  if (g.fees) console.log(dim(`fees: ${describeFees(g.fees)}`));
   if (d.action !== 'skip') console.log(dim(`auto-renew would ${d.action}: ${d.reason}`));
 }
 
@@ -513,16 +650,17 @@ async function grantStatus(ctx, o) {
  * block our transaction was final in (and devnet finality sometimes lags by minutes), so one immediate sync can still
  * show the old state.
  */
-async function syncGrant(ctx, { delegate, expect, cap, maxMs = 180_000, everyMs = 5_000 } = {}) {
+async function syncGrant(ctx, { delegate, feeDelegate, expect, cap, maxMs = 180_000, everyMs = 5_000 } = {}) {
   if (!ctx.api.hasKey) return err(dim('No API key yet: run `floprouter login`, then `floprouter balance` shows the grant.'));
   const t0 = Date.now(); let said = false; let g = null;
   for (;;) {
     try { g = await ctx.api.post('/v1/grants/sync', {}); } catch (e) { err(yellow(`the router could not read the grant yet: ${describe(e)}`)); return; }
     const x = grantOf(g, delegate);
     const state = x?.state ?? 'none';
-    const done = expect === 'active' ? state === 'active' && x.active !== false && (cap === undefined || Number(x.spending_cap) === Number(cap))
-      : state !== 'waiting_for_finality' && !(x?.active === true && state === 'active');
-    if (done) return err(`router sees: ${describeGrant(g)}`);
+    const feeOk = !feeDelegate || grantOf(g, feeDelegate)?.state === 'active';
+    const done = expect === 'active' ? state === 'active' && x.active !== false && feeOk && (cap === undefined || Number(x.spending_cap) === Number(cap))
+      : state !== 'waiting_for_finality' && !(x?.active === true && state === 'active') && !(g?.data ?? []).some((y) => y.state === 'waiting_for_finality' || (y.active === true && y.state === 'active'));
+    if (done) { err(`router sees: ${describeGrant(g)}`); if (feeDelegate) err(`              fee grant: ${describeGrant(g, 'fee', g?.fees)}`); return; }
     if (Date.now() - t0 > maxMs) {
       return err(yellow(`router still sees: ${describeGrant(g)}. It reads grants at its finalized block, which is behind; check again with \`floprouter grant --status\`.`));
     }
@@ -712,7 +850,13 @@ export async function withdraw(ctx, o, args) {
 }
 
 export function describe(e) {
+  const chainMsg = explainChainError(e);
+  if (chainMsg) return chainMsg;
   if (e instanceof ApiError) {
+    if (e.status === 402 && e.code === 'fees_owed') {
+      const m = e.metadata ?? {};
+      return `Fees owed: ${m.amount ?? '?'} FLOP${m.max_owed ? ` (the limit is ${m.max_owed})` : ''}. Sign again with \`floprouter grant\` to renew the fee grant (one signature), or pay them with \`floprouter deposit <amount>\`.`;
+    }
     if (e.status === 401) return `${e.message}\nRun \`floprouter login\` or set FLOPROUTER_API_KEY.`;
     if (e.status === 402 && /^grant_/.test(e.code)) return `${e.message}\nSign a new grant with \`floprouter grant\`, or retry with \`--fallback-payer credit\`.`;
     if (e.status === 503 && e.metadata?.retry_after) return `${e.code}: ${e.message} (retry after ${e.metadata.retry_after} s)`;

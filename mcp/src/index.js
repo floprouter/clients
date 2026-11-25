@@ -21,9 +21,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { ApiError, DEFAULT_BASE_URL, costOf, isMissingRoute, makeClient, modelFacts } from './api.js';
-import { decideRenewal, grantFacts, grantWarning, parseDuration, renewIfDue } from './renewal.js';
+import { decideRenewal, explainChainError, grantFacts, grantWarning, parseDuration, renewIfDue } from './renewal.js';
 
-const VERSION = '0.1.3';
+const VERSION = '0.2.0';
 const env = process.env;
 // Fallback: the file written by `floprouter login` (the CLI), so one login serves both.
 function cliConfig() {
@@ -60,7 +60,7 @@ const fail = (e) => {
   const meta = e instanceof ApiError ? Object.entries(e.metadata ?? {}).filter(([k]) => k !== 'reason').map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' ') : '';
   const msg = e instanceof ApiError
     ? `floprouter API error ${e.status} ${e.code}: ${e.message}${meta ? ` (${meta})` : ''}`
-    : `error: ${e?.message ?? e}`;
+    : `error: ${explainChainError(e) ?? e?.message ?? e}`;
   return { isError: true, content: [{ type: 'text', text: msg }] };
 };
 const tool = (fn) => async (args, extra) => { try { return await fn(args ?? {}, extra); } catch (e) { return fail(e); } };
@@ -116,7 +116,8 @@ export function buildServer({ apiKey } = {}) {
     let g; try { g = await api.get('/v1/grants'); } catch { return null; }
     const f = grantFacts(g);
     const d = decideRenewal(f, { renewBeforeSec: RENEW_BEFORE });
-    return { facts: f, decision: d, warning: grantWarning(f, { renewBeforeSec: RENEW_BEFORE }) };
+    const fee = g?.fees || (Array.isArray(g?.data) && g.data.some((x) => x.kind === 'fee')) ? grantFacts(g, undefined, Date.now(), 'fee') : null;
+    return { facts: f, decision: d, warning: grantWarning(f, { renewBeforeSec: RENEW_BEFORE }), fees: g?.fees ?? null, feeGrant: fee };
   }
   const runRenew = async (dryRun) => {
     let wallet;
@@ -211,10 +212,13 @@ export function buildServer({ apiKey } = {}) {
     const messages = a.messages?.length ? a.messages
       : a.prompt ? [...(a.system ? [{ role: 'system', content: a.system }] : []), { role: 'user', content: a.prompt }] : null;
     if (!messages) throw new Error('give `prompt` or `messages`');
-    let renewed = null;
+    let renewed = null; let renewError = null;
     if (AUTO_RENEW) {
-      const gs = await grantState();
-      if (gs && (gs.decision.action === 'renew')) renewed = await runRenew(false);
+      // A renewal that cannot be done (the router's batch is refused, the chain is slow) must not fail the chat: the grant still works until it expires.
+      try {
+        const gs = await grantState();
+        if (gs && (gs.decision.action === 'renew')) renewed = await runRenew(false);
+      } catch (e) { renewError = explainChainError(e) ?? e?.message ?? String(e); }
     }
     const pinned = a.miner ? (Array.isArray(a.miner) ? a.miner : [a.miner]) : null;
     const body = {
@@ -271,6 +275,7 @@ export function buildServer({ apiKey } = {}) {
     return ok({
       ...(gs?.warning ? { grant_warning: gs.warning } : {}),
       ...(renewed ? { grant_renewed: { action: renewed.action, reason: renewed.reason, tx: renewed.tx ?? null } } : {}),
+      ...(renewError ? { grant_renewal_error: renewError } : {}),
       reply: content, finish_reason: finish, model,
       generation_id: id ?? flop?.session_id ?? null,
       cost_flop: costOf({ usage }), cost_final: usage?.cost_details?.final ?? null,
@@ -304,7 +309,7 @@ export function buildServer({ apiKey } = {}) {
 
   server.registerTool('account', {
     title: 'Balance, key and grant',
-    description: 'The calling wallet\'s prepaid FLOP balance (available, held, deposit address, fee, recent ledger entries, withdrawals), this API key\'s usage in FLOP and rate limits, and the state of its on-chain session-key grant. Needs an API key.',
+    description: 'The calling wallet\'s prepaid FLOP balance (available, held, deposit address, fee, recent ledger entries, withdrawals), this API key\'s usage in FLOP and rate limits, the state of its on-chain session-key grants (compute and fee grant by `kind`), and the router fees (`fees`: mode, accrued, collected, owed, last collection). In the default deposit-free mode the router collects its fee from the wallet through the fee grant, so no prepaid balance is needed. Needs an API key.',
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, tool(async () => {
@@ -319,7 +324,7 @@ export function buildServer({ apiKey } = {}) {
 
   server.registerTool('grant_status', {
     title: 'Grant status',
-    description: 'The session-key grant that lets the router open channels paid by the user\'s wallet: state, expiry, days left, spending cap and today\'s room left, and whether renewal is due (under 2 days left or nearly used up). Tell the user when renewal is due: only their wallet can sign a new grant.',
+    description: 'The session-key grant that lets the router open channels paid by the user\'s wallet: state, expiry, days left, spending cap and today\'s room left, and whether renewal is due (under 2 days left or nearly used up). Also the router fees (`fees`: accrued, collected, owed) and the fee grant that pays them. Tell the user when renewal is due: only their wallet can sign a new grant (`floprouter grant`, one signature for both grants).',
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, tool(async () => {
@@ -331,6 +336,8 @@ export function buildServer({ apiKey } = {}) {
       state: f.state, expires_at: f.expiresAt ?? null, days_left: f.expiresInSec !== null && f.expiresInSec !== undefined ? Math.round((f.expiresInSec / 86400) * 10) / 10 : null,
       cap_left: f.remaining ?? null, spending_cap: f.spendingCap ?? null, today_left: f.dayRoom ?? null, per_session_limit: f.perTxLimit ?? null,
       renewal_due: gs.decision.action === 'renew' || gs.decision.action === 'grant', reason: gs.decision.reason, warning: gs.warning,
+      // The deposit-free router fee: its totals (mode, accrued, collected, owed, last collection) and the fee grant that pays it.
+      fees: gs.fees, fee_grant: gs.feeGrant ? { state: gs.feeGrant.state, expires_at: gs.feeGrant.expiresAt ?? null, cap_left: gs.feeGrant.remaining ?? null, spending_cap: gs.feeGrant.spendingCap ?? null } : null,
       renewal_by_this_server: SIGNING_ENABLED ? (AUTO_RENEW ? 'enabled, automatic before chat' : 'enabled (renew_grant)') : 'off: the user renews with `floprouter grant` or `floprouter grant --auto-renew`',
     });
   }));
@@ -338,7 +345,7 @@ export function buildServer({ apiKey } = {}) {
   if (SIGNING_ENABLED) {
     server.registerTool('renew_grant', {
       title: 'Renew the grant (signs a transaction)',
-      description: 'SIGNS A TRANSACTION WITH THE WALLET CONFIGURED FOR THIS SERVER. Renews the session-key grant only when it is due (expiring within the window, expired, or nearly used up): one utility.batchAll of revokeSession and createSession to the router\'s delegate, with exactly the current caps and only ComputeChannel. Does nothing when no renewal is due; never creates a grant from nothing and never raises caps. Every signature is logged. Use dry_run to see what it would sign.',
+      description: 'SIGNS A TRANSACTION WITH THE WALLET CONFIGURED FOR THIS SERVER. Renews the session-key grant only when it is due (expiring within the window, expired, or nearly used up). One utility.batchAll with the router\'s own caps, checked before signing: revokeSession of the wallet\'s known grants, createSession to the router\'s delegate with exactly the current caps and only ComputeChannel and, when the wallet already has a fee grant, createSession of the fee grant (only Balances, with the caps the router states). Does nothing when no renewal is due; never creates a grant from nothing, never adds a first fee grant and never raises caps, the fee grant\'s included (it refuses if the router\'s compute caps differ from the current ones, or its fee caps are above those of the fee grant it replaces). Every signature is logged. Use dry_run to see what it would sign.',
       inputSchema: { dry_run: z.boolean().optional().describe('Check and describe the renewal without signing') },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     }, tool(async ({ dry_run }) => ok(await runRenew(Boolean(dry_run)))));

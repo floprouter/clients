@@ -5,7 +5,7 @@ import { makeClient, DEFAULT_BASE_URL } from '../src/api.js';
 import { configPath, dim, err, readConfig, red, writeConfig } from '../src/io.js';
 import * as cmd from '../src/commands.js';
 
-const VERSION = '0.1.3';
+const VERSION = '0.2.0';
 
 const HELP = `floprouter ${VERSION}: the floprouter API from the command line (chat with FLOP Network miners, paid in FLOP)
 
@@ -39,22 +39,27 @@ Use (needs an API key)
       --fallback-payer credit  in grant mode, run in credit mode when no miner has a live signed offer
   session [<id>]                           one session's settlement state, or your recent sessions
   generation <id>                          tokens, cost in FLOP, latency and reply of one request
-  balance                                  prepaid balance, deposit address, withdrawals, grant state
+  balance                                  prepaid balance, deposit address, withdrawals, grant and router-fee state
   key                                      this API key: usage in FLOP, rate limits, payer mode
   withdraw <amount|all>                    send prepaid balance back to your wallet
 
 Wallet (signs locally; keys never leave this machine)
-  login                                    create an API key by signing the router's challenge
-      --name <label> --payer grant|credit --show-key --no-save --wrap-bytes
+  login                                    create an API key by signing the router's challenge; in grant mode it then
+                                           asks for the one grant signature, so a new user runs one command
+      --name <label> --payer grant|credit --show-key --no-save --wrap-bytes --no-grant --no-fee-grant
   keys [revoke <id> | payer <id> grant|credit]   list, revoke or re-mode your API keys
   key --show                               print the stored API key itself
   logout                                   forget the stored API key
-  grant                                    sign the one-time session-key grant (you stay the on-chain payer)
+  grant                                    sign the session-key grants: ONE signature covers the compute grant and the
+                                           fee grant (deposit-free fees); you stay the on-chain payer
+      --no-fee-grant     compute-only grant (own caps below); the router fee is then paid from a deposit
       --spending-cap <FLOP> --per-tx <FLOP> --daily-cap <FLOP> --days <n> --fee-float <FLOP> --max-float <FLOP>
-      --revoke --status [--json]
+                         (caps and float only with --no-fee-grant: the one-signature grant uses the router's caps)
+      --revoke (every grant to the router) --status [--json]
       --auto-renew [--renew-before 2d] [--min-remaining <FLOP>] [--min-daily <FLOP>] [--dry-run] [--json]
                          renew only when needed (missing, revoked, expiring, nearly used up); for cron and agents
-  deposit <amount>                         transfer FLOP from your wallet to your router balance
+  deposit <amount>                         transfer FLOP from your wallet to your router balance (optional: the fee
+                                           grant makes a deposit unnecessary; use it to prepay instead)
 
   Wallet options: --key-file <polkadot-js JSON>  or  --seed-file <file with mnemonic/seed>
                   (or FLOPROUTER_KEY_FILE / FLOPROUTER_SEED_FILE; otherwise a hidden prompt)
@@ -75,7 +80,7 @@ const options = {
   'max-tokens': { type: 'string' }, system: { type: 'string' }, wait: { type: 'boolean' }, payer: { type: 'string' },
   name: { type: 'string' }, 'show-key': { type: 'boolean' }, 'no-save': { type: 'boolean' }, 'wrap-bytes': { type: 'boolean' }, show: { type: 'boolean' },
   'spending-cap': { type: 'string' }, 'per-tx': { type: 'string' }, 'daily-cap': { type: 'string' }, days: { type: 'string' },
-  'fee-float': { type: 'string' }, 'max-float': { type: 'string' }, 'auto-renew': { type: 'boolean' }, 'dry-run': { type: 'boolean' }, 'renew-before': { type: 'string' }, 'min-remaining': { type: 'string' }, 'min-daily': { type: 'string' }, revoke: { type: 'boolean' }, status: { type: 'boolean' },
+  'fee-float': { type: 'string' }, 'max-float': { type: 'string' }, 'no-fee-grant': { type: 'boolean' }, 'no-grant': { type: 'boolean' }, 'auto-renew': { type: 'boolean' }, 'dry-run': { type: 'boolean' }, 'renew-before': { type: 'string' }, 'min-remaining': { type: 'string' }, 'min-daily': { type: 'string' }, revoke: { type: 'boolean' }, status: { type: 'boolean' },
   'key-file': { type: 'string' }, 'seed-file': { type: 'string' }, 'password-file': { type: 'string' }, type: { type: 'string' }, rpc: { type: 'string' }, yes: { type: 'boolean', short: 'y' },
 };
 
@@ -91,7 +96,8 @@ async function main() {
   const saved = readConfig();
   const baseUrl = o['base-url'] || process.env.FLOPROUTER_BASE_URL || saved.base_url || DEFAULT_BASE_URL;
   const apiKey = (o['api-key-env'] ? process.env[o['api-key-env']] : process.env.FLOPROUTER_API_KEY) || saved.api_key;
-  const ctx = { api: makeClient({ baseUrl, apiKey, userAgent: `floprouter-cli/${VERSION}`, title: 'floprouter CLI' }) };
+  const withKey = (key) => makeClient({ baseUrl, apiKey: key, userAgent: `floprouter-cli/${VERSION}`, title: 'floprouter CLI' });
+  const ctx = { api: withKey(apiKey), withKey };
 
   switch (command) {
     case 'models': return cmd.models(ctx, o);

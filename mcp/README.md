@@ -2,7 +2,7 @@
 
 MCP server for the [floprouter API](https://floprouter.com). It lets an AI agent list FLOP Network models and miners, run chat requests on GPU miners paid in FLOP, and check generations, sessions, balance and grant state.
 
-It never handles wallet keys. Create an API key, sign a grant, and deposit or withdraw with the `floprouter` CLI.
+It never handles wallet keys. Create an API key, sign the grant (one signature covers the compute grant and the fee grant, so no deposit is needed), and deposit or withdraw with the `floprouter` CLI. `npx floprouter login` does the first two in one command.
 
 ## Run
 
@@ -32,8 +32,8 @@ In HTTP mode, each request may carry its own key in `Authorization: Bearer fr_..
 | `chat` | One paid chat request. Inputs: `prompt` or `messages`, `model`, optional `fallback_models`, `miner` (pin one or a list), `allow_fallbacks`, `max_tokens`, `payer`, `fallback_payer`, `wait_for_settlement`. Returns the reply, `generation_id`, cost in FLOP, ignored parameters, and the session (miner, escrow, payer) | spends FLOP |
 | `generation` | One request by id: tokens, cost in FLOP, finish reason, latency, verified reply | no |
 | `session_status` | Settlement state of a session | no |
-| `account` | Balance (available, held, deposit address, fee, recent ledger, withdrawals), this key's usage and limits, grant state | no |
-| `grant_status` | The session-key grant: state, expiry, days left, cap left, today's room, whether renewal is due | no |
+| `account` | Balance (available, held, deposit address, fee, recent ledger, withdrawals), this key's usage and limits, grant state (compute and fee grants), and the router fees (mode, accrued, collected, owed, last collection) | no |
+| `grant_status` | The session-key grant: state, expiry, days left, cap left, today's room, whether renewal is due; plus the fees and the fee grant | no |
 | `renew_grant` | **Only in opt-in mode (below). Signs a transaction with the configured wallet.** Renews the grant when it is due, with the same caps | signs |
 | `withdraw` | Sends prepaid balance back to the wallet that owns the key | to the owner only |
 | `router_status` | Network, sync state and payer | no |
@@ -59,7 +59,8 @@ Signing needs the polkadot packages, which the CLI brings: run the server as `np
 `renew_grant` runs the same code as `floprouter grant --auto-renew` (one shared module), with stricter rules:
 
 - It renews only when due: expiring within the window, or expired.
-- It signs only `utility.batchAll[revokeSession, createSession]` to the router's delegate, with exactly the current caps and only `ComputeChannel`.
+- It signs only the router's batch, checked before signing, built locally and compared with the router's `call_data`: `utility.batchAll` of `revokeSession` calls (grants this wallet is known to have made), `createSession` to the router's delegate with exactly the current caps and only `ComputeChannel`, and `createSession` of the fee grant (only `Balances`, with exactly the caps the router states). If the router's compute caps differ from the current ones, or its fee caps are above those of the fee grant it replaces, it refuses. A refused automatic renewal never fails a `chat`: the result carries `grant_renewal_error`.
+- A wallet with no fee grant (a compute-only grant, fees paid from a deposit) is renewed compute-only, as before. This server never adds a first fee grant: that is `floprouter grant`, signed by the owner.
 - It never creates a grant from nothing and never raises a cap. A grant that is nearly used up is reported, and the user is asked to raise the cap themselves: the chain carries the amount spent over a renewal, so the same caps would not restore room.
 - It refuses any other renewal the router describes.
 - It never takes a key or seed as a tool argument.
