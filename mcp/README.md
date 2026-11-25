@@ -38,7 +38,7 @@ In HTTP mode, each request may carry its own key in `Authorization: Bearer fr_..
 | `withdraw` | Sends prepaid balance back to the wallet that owns the key | to the owner only |
 | `router_status` | Network, sync state and payer | no |
 
-`chat` returns once the miner's reply is verified, typically in 10 to 40 s (on devnet, often 1 to 2 minutes when a channel has to be opened without an offer). If that takes longer than the tool budget, it returns `pending: true` with the `generation_id`. The request carries on and can be read with `generation` a minute later. The on-chain settlement follows 2 to 5 minutes after the reply; check it with `session_status`.
+`chat` returns once the miner's reply is verified, typically in 10 to 40 s (often 1 to 2 minutes when a channel has to be opened without an offer). If that takes longer than the tool budget, it returns `pending: true` with the `generation_id`. The request carries on and can be read with `generation` a minute later. The on-chain settlement follows 2 to 5 minutes after the reply; check it with `session_status`.
 
 ## Grant warnings and opt-in renewal
 

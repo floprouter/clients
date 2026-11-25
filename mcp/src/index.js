@@ -23,7 +23,7 @@ import { z } from 'zod';
 import { ApiError, DEFAULT_BASE_URL, costOf, isMissingRoute, makeClient, modelFacts } from './api.js';
 import { decideRenewal, grantFacts, grantWarning, parseDuration, renewIfDue } from './renewal.js';
 
-const VERSION = '0.1.2';
+const VERSION = '0.1.3';
 const env = process.env;
 // Fallback: the file written by `floprouter login` (the CLI), so one login serves both.
 function cliConfig() {

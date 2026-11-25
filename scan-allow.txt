@@ -6,3 +6,4 @@
 0xfab8ec57f3bc1b5d4ca644fe12fab2ca1c35c24697d577c610b382cfea14d52d model Qwen/Qwen3-8B
 0x272ed49f5488f15629805df7821140b3b1ad3917d6ccb008add3c65d0095dea9 model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
 0x9fe1ce953cd69531eb321e7da9cf40501d5feb54a2f12afc6918e455408d0426 model Qwen/Qwen3.8-27B
+0x918abd58fb16306b30ef3886514cfaebffecb4de43e82b6f8ec4795c43cfd800 genesis (testnet.json, published on flop.finance/testnet)

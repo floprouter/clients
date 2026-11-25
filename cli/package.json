@@ -1,6 +1,6 @@
 {
   "name": "floprouter",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Command-line client for the floprouter API: FLOP Network miners and models, paid chat completions, and local wallet signing for login, grants, deposits and withdrawals",
   "author": "floprouter",
   "license": "MIT",
